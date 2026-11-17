@@ -51,6 +51,21 @@ pub struct BucketTracker {
     pub pending_usage: HashMap<String, UsageEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredQuotaSample {
+    pub bucket_id: String,
+    pub remaining_fraction: f64,
+    pub reset_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaSnapshotRecord {
+    pub timestamp: i64,
+    pub provider: String,
+    pub tier: String,
+    pub quotas: Vec<StoredQuotaSample>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CliToolState {
     /// Legacy per-file auth (migrated to shared auth.json on save/load)
@@ -79,6 +94,9 @@ pub struct CliToolState {
     /// Mapping from conversation/session ID to last observed model ID (for concurrent tabs)
     #[serde(default)]
     pub session_models: HashMap<String, String>,
+    /// Queued quota snapshots written by fast statusLine hooks for agy-worker
+    #[serde(default)]
+    pub quota_snapshots: Vec<QuotaSnapshotRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,7 +270,7 @@ pub async fn run_stdin_adapter_with_state<F>(
     }
 }
 
-async fn run_chained_command(cmd: &str, stdin_payload: &str, verbose: bool) {
+pub async fn run_chained_command(cmd: &str, stdin_payload: &str, verbose: bool) {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
@@ -460,7 +478,15 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
             });
 
         let reset_jumped = match (&tracker.last_reset_time, &q.reset_time) {
-            (Some(prev), Some(curr)) => curr != prev && frac >= tracker.last_remaining_fraction,
+            (Some(prev), Some(curr)) if curr != prev => {
+                match (
+                    DateTime::parse_from_rfc3339(prev),
+                    DateTime::parse_from_rfc3339(curr),
+                ) {
+                    (Ok(p_dt), Ok(c_dt)) => c_dt.timestamp() > p_dt.timestamp() + 60,
+                    _ => frac >= tracker.last_remaining_fraction,
+                }
+            }
             _ => false,
         };
 

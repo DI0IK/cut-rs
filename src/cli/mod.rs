@@ -1,4 +1,5 @@
 pub mod agy;
+pub mod agy_worker;
 pub mod claude;
 pub mod codex;
 pub mod common;
@@ -24,8 +25,10 @@ pub enum Commands {
     /// Run the HTTP telemetry ingestion and estimation server
     #[command(alias = "server")]
     Serve,
-    /// Process Antigravity CLI statusLine JSON from stdin and log quota telemetry
+    /// Process Antigravity CLI statusLine JSON from stdin and record quota snapshots
     AgyCli(agy::AgyCliArgs),
+    /// Persistent background worker that reads Antigravity transcripts & conversation DBs
+    AgyWorker(agy_worker::AgyWorkerArgs),
     /// Process Claude Code statusLine JSON from stdin and log quota telemetry
     ClaudeCli(claude::ClaudeCliArgs),
     /// Incrementally scan local Codex CLI rollout logs (~/.codex/sessions) and log telemetry
