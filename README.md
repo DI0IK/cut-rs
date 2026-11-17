@@ -6,6 +6,30 @@ Default public server & live dashboard: **`https://cut-rs.dominikstahl.dev`**
 
 ---
 
+## 30-Second Quickstart
+
+**1. Install the binary:**
+```bash
+# Linux & macOS
+curl -fsSL https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.sh | sh
+```
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.ps1 | iex
+```
+*(Or download a prebuilt archive from [GitHub Releases](https://github.com/DI0IK/cut-rs/releases).)*
+
+**2. Auto-configure your AI coding tools & verify:**
+```bash
+cut-rs init
+cut-rs status
+```
+`cut-rs init` detects **Claude Code**, **OpenAI Codex**, **Antigravity CLI**, and **Waybar**, backs up existing configs (`.bak`), and **prepends** `cut-rs --chain ...` if you already have a custom `statusLine` so your existing status line keeps working.
+
+> **Privacy & ToS:** Only token count deltas and quota `%` changes are sent. Prompts, code, and raw IP addresses are never collected or stored. All adapters use official local interfaces (`statusLine`, `notify`, local rollout logs).
+
+---
+
 ## Dashboard
 
 `cut-rs` serves an embedded React + TypeScript + Vite dashboard at `/` (bundled into the single binary via `rust-embed`):
@@ -124,7 +148,7 @@ devenv shell -- cargo clippy --all-targets -- -D warnings
 `flake.nix` provides `packages.<system>.default` and `nixosModules.default` (`services.cut-rs` with a hardened `systemd` unit):
 ```nix
 {
-  inputs.cut-rs.url = "github:your-org/cut-rs";
+  inputs.cut-rs.url = "github:DI0IK/cut-rs";
 
   outputs = { nixpkgs, cut-rs, ... }: {
     nixosConfigurations.server = nixpkgs.lib.nixosSystem {

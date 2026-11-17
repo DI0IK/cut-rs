@@ -2,7 +2,7 @@ use clap::Parser;
 use cut_rs::api::build_router;
 use cut_rs::cli::{
     Cli, Commands, agy::run_agy_cli, claude::run_claude_cli, codex::run_codex_cli,
-    waybar::run_waybar,
+    init::run_init, status::run_status, waybar::run_waybar,
 };
 use cut_rs::config::Config;
 use cut_rs::init_app_state;
@@ -15,6 +15,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init(args) => {
+            return run_init(args).await;
+        }
+        Commands::Status(args) => {
+            run_status(args).await;
+            return Ok(());
+        }
         Commands::AgyCli(args) => {
             run_agy_cli(args).await;
             return Ok(());

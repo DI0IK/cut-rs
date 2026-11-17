@@ -21,6 +21,14 @@ export function App() {
     { tier: string; view: WindowEstimateView }[]
   >([]);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
+  const [showSetup, setShowSetup] = useState(false);
+  const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
+
+  const copyCommand = (id: string, text: string) => {
+    navigator.clipboard?.writeText(text);
+    setCopiedCmd(id);
+    setTimeout(() => setCopiedCmd(null), 1500);
+  };
 
   const providers = useMemo(
     () => Array.from(new Set(partitions.map((p) => p.provider))).sort(),
@@ -253,19 +261,59 @@ export function App() {
           <button type="button" className="btn" onClick={refreshData}>
             Refresh
           </button>
+
+          <button
+            type="button"
+            className="btn btn-accent"
+            onClick={() => setShowSetup(true)}
+          >
+            Setup CLI
+          </button>
+
+          <a
+            className="btn"
+            href="https://github.com/DI0IK/cut-rs"
+            target="_blank"
+            rel="noreferrer"
+            style={{ textDecoration: "none" }}
+          >
+            GitHub
+          </a>
         </div>
       </header>
+
+      {providers.length === 0 && (
+        <div className="onboard-banner">
+          <span>
+            No telemetry data yet. Install the CLI in 30 seconds to contribute
+            anonymous quota samples from Claude Code, Codex, or Antigravity CLI.
+          </span>
+          <button
+            type="button"
+            className="btn btn-accent"
+            onClick={() => setShowSetup(true)}
+          >
+            Get Started
+          </button>
+        </div>
+      )}
 
       <section className="kpi-strip">
         <div className="kpi">
           <div className="kpi-label">Window Samples</div>
           <div className="kpi-val">{totalSamples}</div>
         </div>
-        <div className="kpi">
+        <div
+          className="kpi"
+          title="Effective independent contributors after the 5% per-client weight cap"
+        >
           <div className="kpi-label">Eff. Contributors</div>
           <div className="kpi-val">{maxContributors.toFixed(1)}</div>
         </div>
-        <div className="kpi">
+        <div
+          className="kpi"
+          title="Empirical share of input, output, and cached tokens across recent samples"
+        >
           <div className="kpi-label">Crowdsourced Token Mix</div>
           <div className="kpi-val" style={{ fontSize: 13 }}>
             {(avgMix.in_share * 100).toFixed(0)}% in ·{" "}
@@ -317,6 +365,99 @@ export function App() {
           )}
         </div>
       </section>
+
+      {showSetup && (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setShowSetup(false)}
+        >
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="panel-head">
+              <span className="panel-title">Contribute Telemetry (60s Setup)</span>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setShowSetup(false)}
+              >
+                Close
+              </button>
+            </div>
+            <div className="modal-body">
+              <p className="modal-lead">
+                Supports <strong>Claude Code</strong>, <strong>OpenAI Codex</strong>,{" "}
+                <strong>Antigravity CLI</strong>, and <strong>Waybar</strong> using
+                only official local interfaces.
+              </p>
+
+              <div className="setup-step">
+                <div className="setup-label">1. Install binary (Linux / macOS)</div>
+                <div className="code-row">
+                  <code>
+                    curl -fsSL https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.sh | sh
+                  </code>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() =>
+                      copyCommand(
+                        "unix",
+                        "curl -fsSL https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.sh | sh"
+                      )
+                    }
+                  >
+                    {copiedCmd === "unix" ? "Copied" : "Copy"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="setup-step">
+                <div className="setup-label">1b. Install binary (Windows PowerShell)</div>
+                <div className="code-row">
+                  <code>
+                    irm https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.ps1 | iex
+                  </code>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() =>
+                      copyCommand(
+                        "win",
+                        "irm https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.ps1 | iex"
+                      )
+                    }
+                  >
+                    {copiedCmd === "win" ? "Copied" : "Copy"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="setup-step">
+                <div className="setup-label">
+                  2. Auto-detect tools &amp; configure hooks safely
+                </div>
+                <div className="code-row">
+                  <code>cut-rs init &amp;&amp; cut-rs status</code>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => copyCommand("init", "cut-rs init && cut-rs status")}
+                  >
+                    {copiedCmd === "init" ? "Copied" : "Copy"}
+                  </button>
+                </div>
+              </div>
+
+              <p className="modal-note">
+                Privacy: only token count deltas and quota % changes are submitted.
+                Prompts, code, and raw IP addresses are never collected or stored.
+                Preexisting <code>statusLine</code> commands are chained automatically.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

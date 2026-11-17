@@ -1,7 +1,11 @@
 [package]
 name = "cut-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "Crowdsourced AI quota telemetry server, estimator, and local CLI"
+license = "MIT"
+repository = "https://github.com/DI0IK/cut-rs"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"

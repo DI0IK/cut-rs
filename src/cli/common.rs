@@ -30,6 +30,10 @@ pub struct CommonClientArgs {
     /// Log errors to stderr instead of failing silently
     #[arg(long, default_value_t = false)]
     pub verbose: bool,
+
+    /// Optional preexisting command to forward stdin to (runs concurrently, preserving its stdout)
+    #[arg(long)]
+    pub chain: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,29 +170,81 @@ pub async fn run_stdin_adapter<F>(
 ) where
     F: FnOnce(&str, i64) -> anyhow::Result<Option<TickInput>>,
 {
-    if let Err(err) = run_stdin_adapter_inner(args, default_state_filename, parse_tick).await
-        && args.verbose
-    {
-        eprintln!("cut-rs: {err:#}");
+    let mut stdin_buf = String::new();
+    if std::io::stdin().read_to_string(&mut stdin_buf).is_err() {
+        return;
+    }
+
+    let telemetry_fut = async {
+        if let Err(err) =
+            run_stdin_adapter_inner(args, default_state_filename, &stdin_buf, parse_tick).await
+            && args.verbose
+        {
+            eprintln!("cut-rs: {err:#}");
+        }
+    };
+
+    if let Some(chain_cmd) = args.chain.as_deref().filter(|s| !s.trim().is_empty()) {
+        let chain_fut = run_chained_command(chain_cmd, &stdin_buf, args.verbose);
+        tokio::join!(telemetry_fut, chain_fut);
+    } else {
+        telemetry_fut.await;
+    }
+}
+
+async fn run_chained_command(cmd: &str, stdin_payload: &str, verbose: bool) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(cmd);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    };
+
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    match command.spawn() {
+        Ok(mut child) => {
+            if let Some(mut child_stdin) = child.stdin.take() {
+                let _ = child_stdin.write_all(stdin_payload.as_bytes()).await;
+                let _ = child_stdin.shutdown().await;
+            }
+            let _ = child.wait().await;
+        }
+        Err(err) => {
+            if verbose {
+                eprintln!("cut-rs: failed to run chained statusLine command: {err}");
+            }
+        }
     }
 }
 
 async fn run_stdin_adapter_inner<F>(
     args: &CommonClientArgs,
     default_state_filename: &str,
+    stdin_buf: &str,
     parse_tick: F,
 ) -> anyhow::Result<()>
 where
     F: FnOnce(&str, i64) -> anyhow::Result<Option<TickInput>>,
 {
-    let mut stdin_buf = String::new();
-    std::io::stdin().read_to_string(&mut stdin_buf)?;
     if stdin_buf.trim().is_empty() {
         return Ok(());
     }
 
     let now = Utc::now().timestamp();
-    let Some(tick) = parse_tick(&stdin_buf, now)? else {
+    let Some(tick) = parse_tick(stdin_buf, now)? else {
         return Ok(());
     };
 
@@ -395,7 +451,7 @@ pub async fn flush_pending_intervals(state: &mut CliToolState, server: &str, tim
     }
 }
 
-async fn register_client(client: &reqwest::Client, server: &str) -> anyhow::Result<SavedAuth> {
+pub async fn register_client(client: &reqwest::Client, server: &str) -> anyhow::Result<SavedAuth> {
     #[derive(Deserialize)]
     struct ChallengeResp {
         challenge: String,

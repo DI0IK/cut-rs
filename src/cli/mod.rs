@@ -2,6 +2,8 @@ pub mod agy;
 pub mod claude;
 pub mod codex;
 pub mod common;
+pub mod init;
+pub mod status;
 pub mod waybar;
 
 use clap::{Parser, Subcommand};
@@ -15,6 +17,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Auto-detect installed AI coding tools and configure cut-rs hooks safely
+    Init(init::InitArgs),
+    /// Check server connectivity, hook configuration, pending telemetry, and local quota
+    Status(status::StatusArgs),
     /// Run the HTTP telemetry ingestion and estimation server
     #[command(alias = "server")]
     Serve,
