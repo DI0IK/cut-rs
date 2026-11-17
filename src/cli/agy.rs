@@ -131,21 +131,43 @@ impl StatusLinePayload {
         let mut by_model: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
         let mut any_transcript_read = false;
 
-        // Collect explicit transcript_path first (so subagents are discovered immediately),
-        // then all other recently active transcripts under <brain_root>.
+        // Collect explicit transcript_path (or session_id-derived path) first so subagents are
+        // discovered immediately, then all other recently active transcripts under <brain_root>.
         let mut candidate_paths: Vec<PathBuf> = Vec::new();
+        let mut brain_root: Option<PathBuf> = None;
+
         if let Some(t_path_str) = self
             .transcript_path
             .as_deref()
             .filter(|s| !s.trim().is_empty())
         {
             let t_path = PathBuf::from(t_path_str);
-            candidate_paths.push(t_path.clone());
-            if let Some(brain_root) = resolve_brain_root(&t_path) {
-                for p in discover_recent_brain_transcripts(&brain_root, 1800) {
-                    if !candidate_paths.contains(&p) {
-                        candidate_paths.push(p);
+            brain_root = resolve_brain_root(&t_path);
+            candidate_paths.push(t_path);
+        } else {
+            #[cfg(not(test))]
+            if let Some(home) = dirs::home_dir() {
+                let default_brain = home.join(".gemini").join("antigravity-cli").join("brain");
+                if default_brain.is_dir() {
+                    if session_id != "default" {
+                        let derived = default_brain
+                            .join(&session_id)
+                            .join(".system_generated")
+                            .join("logs")
+                            .join("transcript.jsonl");
+                        if derived.exists() {
+                            candidate_paths.push(derived);
+                        }
                     }
+                    brain_root = Some(default_brain);
+                }
+            }
+        }
+
+        if let Some(root) = brain_root {
+            for p in discover_recent_brain_transcripts(&root, 1800) {
+                if !candidate_paths.contains(&p) {
+                    candidate_paths.push(p);
                 }
             }
         }
