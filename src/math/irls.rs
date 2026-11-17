@@ -35,8 +35,9 @@ pub fn fit_irls_nnls(
         return None;
     }
 
-    // 1. Discover models present in the window, their sample counts and last_seen_at
+    // 1. Discover models present in the window, their sample counts, solo counts, and last_seen_at
     let mut model_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut solo_counts: HashMap<String, usize> = HashMap::new();
     let mut model_last_seen: HashMap<String, i64> = HashMap::new();
     for iv in intervals {
         let mut seen_in_iv = std::collections::HashSet::new();
@@ -50,13 +51,24 @@ pub fn fit_irls_nnls(
                 *entry = iv.ended_at;
             }
         }
+        if seen_in_iv.len() == 1
+            && let Some(only_m) = seen_in_iv.into_iter().next()
+        {
+            *solo_counts.entry(only_m).or_insert(0) += 1;
+        }
     }
 
-    // Keep models that have >= 1 sample (if total intervals < 10) or >= 2 samples
+    // Keep models that have >= min_support, and if any model in this bucket has a solo
+    // interval, require solo_count >= 1 to exclude cross-bucket spillover models.
     let min_support = if intervals.len() < 10 { 1 } else { 2 };
+    let any_has_solo = model_counts
+        .keys()
+        .any(|m| solo_counts.get(m).copied().unwrap_or(0) >= 1);
     let active_models: Vec<String> = model_counts
         .iter()
-        .filter(|&(_, &cnt)| cnt >= min_support)
+        .filter(|&(m, &cnt)| {
+            cnt >= min_support && (!any_has_solo || solo_counts.get(m).copied().unwrap_or(0) >= 1)
+        })
         .map(|(m, _)| m.clone())
         .collect();
 
@@ -289,6 +301,10 @@ pub fn fit_irls_nnls(
         let w_in = w_vec[base];
         let w_out = w_vec[base + 1];
         let w_cache = w_vec[base + 2];
+
+        if m_count > 1 && w_in <= 1e-4 && w_out <= 1e-4 && w_cache <= 1e-4 {
+            continue;
+        }
 
         let se_in = cov[(base, base)].max(0.0).sqrt();
         let se_out = cov[(base + 1, base + 1)].max(0.0).sqrt();

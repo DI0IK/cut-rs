@@ -97,6 +97,9 @@ pub struct CliToolState {
     /// Queued quota snapshots written by fast statusLine hooks for agy-worker
     #[serde(default)]
     pub quota_snapshots: Vec<QuotaSnapshotRecord>,
+    /// Learned mapping of bucket_id -> models observed in clean single-model drops
+    #[serde(default)]
+    pub solo_bucket_models: HashMap<String, std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -398,6 +401,36 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
         (di, do_, dc, reqs)
     };
 
+    let dropping_on_tick: std::collections::HashSet<&str> = tick
+        .quotas
+        .iter()
+        .filter(|q| {
+            q.remaining_fraction.is_finite()
+                && state
+                    .buckets
+                    .get(&q.bucket_id)
+                    .is_some_and(|t| q.remaining_fraction < t.last_remaining_fraction - 1e-7)
+        })
+        .map(|q| q.bucket_id.as_str())
+        .collect();
+
+    let should_accumulate_in_bucket =
+        |bucket_id: &str,
+         model_name: &str,
+         solo_map: &HashMap<String, std::collections::HashSet<String>>| {
+            if dropping_on_tick.contains(bucket_id) {
+                return true;
+            }
+            let model_has_solo_bucket = solo_map.values().any(|ms| ms.contains(model_name));
+            if !model_has_solo_bucket {
+                return true;
+            }
+            match solo_map.get(bucket_id) {
+                Some(known_models) if !known_models.is_empty() => known_models.contains(model_name),
+                _ => true,
+            }
+        };
+
     if tick.skip_emit {
         for tracker in state.buckets.values_mut() {
             tracker.pending_usage.clear();
@@ -409,7 +442,14 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
             if !model_name.is_empty()
                 && (d.tokens_in > 0 || d.tokens_out > 0 || d.tokens_cached_in > 0)
             {
-                for tracker in state.buckets.values_mut() {
+                for (bucket_id, tracker) in state.buckets.iter_mut() {
+                    if !should_accumulate_in_bucket(
+                        bucket_id,
+                        &model_name,
+                        &state.solo_bucket_models,
+                    ) {
+                        continue;
+                    }
                     let entry = tracker
                         .pending_usage
                         .entry(model_name.clone())
@@ -433,7 +473,11 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
     } else if let Some(model_raw) = &tick.model {
         let model_name = normalize_key(model_raw);
         if !model_name.is_empty() && (delta_in > 0 || delta_out > 0 || delta_cached > 0) {
-            for tracker in state.buckets.values_mut() {
+            for (bucket_id, tracker) in state.buckets.iter_mut() {
+                if !should_accumulate_in_bucket(bucket_id, &model_name, &state.solo_bucket_models)
+                {
+                    continue;
+                }
                 let entry = tracker
                     .pending_usage
                     .entry(model_name.clone())
@@ -503,6 +547,11 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
             let quota_after_pct = frac * 100.0;
             let duration = now - tracker.started_at;
             let usage: Vec<UsageEntry> = tracker.pending_usage.values().cloned().collect();
+            let solo_model = if usage.len() == 1 {
+                Some(usage[0].model.clone())
+            } else {
+                None
+            };
             let total_tokens: u64 = usage
                 .iter()
                 .map(|u| u.tokens_in + u.tokens_out + u.tokens_cached_in)
@@ -535,6 +584,13 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
             tracker.last_reset_time = q.reset_time.clone();
             tracker.started_at = now;
             tracker.pending_usage.clear();
+            if let Some(m) = solo_model {
+                state
+                    .solo_bucket_models
+                    .entry(q.bucket_id.clone())
+                    .or_default()
+                    .insert(m);
+            }
         }
     }
 
