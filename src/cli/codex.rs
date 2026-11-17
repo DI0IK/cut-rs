@@ -126,11 +126,11 @@ pub fn scan_codex_sessions(
         .session_id
         .clone()
         .unwrap_or_else(|| "codex-default".to_string());
-    let mut active_model: Option<String> = None;
 
     for (_, path) in files {
         let key = path.to_string_lossy().to_string();
         let offset = state.file_offsets.get(&key).copied().unwrap_or(0);
+        let mut active_model = state.session_models.get(&key).cloned();
 
         let Ok(mut file) = File::open(&path) else {
             continue;
@@ -173,11 +173,16 @@ pub fn scan_codex_sessions(
             line_buf.clear();
         }
 
-        state.file_offsets.insert(key, new_offset);
+        state.file_offsets.insert(key.clone(), new_offset);
+        if let Some(m) = active_model {
+            state.session_models.insert(key, m);
+        }
     }
 
-    // Prune deleted files from file_offsets
+    // Prune deleted files from file_offsets and session_models
     state.file_offsets.retain(|p, _| Path::new(p).exists());
+    state.session_models.retain(|p, _| Path::new(p).exists());
+    state.session_id = Some(active_session);
 
     total_emitted
 }
@@ -276,12 +281,15 @@ fn process_rollout_line(
                 .map(|dt| dt.timestamp())
                 .unwrap_or_else(|| Utc::now().timestamp());
 
+            let uncached_total_in = totals
+                .input_tokens
+                .saturating_sub(totals.cached_input_tokens);
             let tick = TickInput {
                 session_id: active_session.clone(),
                 provider: "codex".to_string(),
                 tier,
                 model: active_model.clone(),
-                total_input_tokens: totals.input_tokens,
+                total_input_tokens: uncached_total_in,
                 total_output_tokens: totals.output_tokens,
                 current_cached_tokens: last_usage
                     .map(|u| u.cached_input_tokens)
@@ -358,11 +366,25 @@ mod tests {
         assert_eq!(state.pending_intervals.len(), 2);
         assert_eq!(state.pending_intervals[0].provider, "codex");
         assert_eq!(state.pending_intervals[0].tier, "plus");
-        assert_eq!(state.pending_intervals[0].usage[0].tokens_in, 40_000);
+        assert_eq!(state.pending_intervals[0].usage[0].tokens_in, 30_000);
         assert_eq!(state.pending_intervals[0].usage[0].tokens_cached_in, 10_000);
 
         // Second scan with no new lines should emit 0
         let emitted_again = scan_codex_sessions(dir.path(), &mut state, "default");
         assert_eq!(emitted_again, 0);
+
+        // Third scan with only a new token_count line should still remember active_model
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-11-17T10:02:10Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":70000,"output_tokens":7000,"cached_input_tokens":22000}},"last_token_usage":{{"input_tokens":20000,"output_tokens":2000,"cached_input_tokens":10000}}}},"rate_limits":{{"primary":{{"used_percent":9.0,"resets_at":1794920000}},"secondary":{{"used_percent":2.0,"resets_at":1795400000}},"plan_type":"plus"}}}}}}"#
+        )
+        .unwrap();
+        let emitted_third = scan_codex_sessions(dir.path(), &mut state, "default");
+        assert_eq!(emitted_third, 2);
+        assert_eq!(state.pending_intervals[2].usage[0].model, "gpt-5-codex");
+        assert_eq!(state.pending_intervals[2].usage[0].tokens_in, 10_000);
+        assert_eq!(state.pending_intervals[2].usage[0].tokens_cached_in, 10_000);
     }
 }

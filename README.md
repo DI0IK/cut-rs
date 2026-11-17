@@ -24,7 +24,7 @@ irm https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.ps1 | ie
 cut-rs init
 cut-rs status
 ```
-`cut-rs init` detects **Claude Code**, **OpenAI Codex**, **Antigravity CLI**, and **Waybar**, backs up existing configs (`.bak`), and **prepends** `cut-rs --chain ...` if you already have a custom `statusLine` so your existing status line keeps working.
+`cut-rs init` configures **Antigravity CLI (Gemini)** and **Waybar** (verified), and also includes experimental adapters for **Claude Code** and **OpenAI Codex**. It backs up existing configs (`.bak`) and **prepends** `cut-rs --chain ...` if you already have a custom `statusLine` so your existing status line keeps working.
 
 > **Privacy & ToS:** Only token count deltas and quota `%` changes are sent. Prompts, code, and raw IP addresses are never collected or stored. All adapters use official local interfaces (`statusLine`, `notify`, local rollout logs).
 
@@ -91,7 +91,7 @@ Add to `~/.gemini/antigravity-cli/settings.json` (Windows: `%USERPROFILE%\.gemin
 }
 ```
 
-### 2. Claude Code CLI & IDE Extension (`cut-rs claude-cli`)
+### 2. Claude Code CLI & IDE Extension (`cut-rs claude-cli`) *(Experimental / Untested)*
 Works with **Claude Code CLI** and **Claude Code IDE extensions** (VS Code / JetBrains / Claude Desktop Code tab) via `~/.claude/settings.json` (Windows: `%USERPROFILE%\.claude\settings.json`):
 ```json
 {
@@ -103,7 +103,7 @@ Works with **Claude Code CLI** and **Claude Code IDE extensions** (VS Code / Jet
 ```
 *(Set `--tier` or `CUT_RS_TIER` to `pro`, `max_5x`, `max_20x`, etc.)*
 
-### 3. OpenAI Codex CLI, Desktop App, & VS Code Extension (`cut-rs codex-cli`)
+### 3. OpenAI Codex CLI, Desktop App, & VS Code Extension (`cut-rs codex-cli`) *(Experimental / Untested)*
 Reads local session rollout logs (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, Windows: `%USERPROFILE%\.codex\sessions\...`) shared by **Codex CLI**, **Codex Desktop**, and the **Codex VS Code extension**:
 - **Codex `notify` hook** (`~/.codex/config.toml`):
   ```toml

@@ -139,6 +139,37 @@ impl ClaudeStatusLinePayload {
     }
 }
 
+fn collect_recent_claude_jsonl(
+    dir: &Path,
+    depth: usize,
+    now: std::time::SystemTime,
+    max_age_secs: u64,
+    out: &mut Vec<PathBuf>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_recent_claude_jsonl(&p, depth + 1, now, max_age_secs, out);
+        } else if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            let is_recent = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|mt| now.duration_since(mt).ok())
+                .is_some_and(|age| age.as_secs() <= max_age_secs);
+            if is_recent {
+                out.push(p);
+            }
+        }
+    }
+}
+
 fn scan_claude_projects(
     projects_dir: &Path,
     state: &mut CliToolState,
@@ -146,41 +177,16 @@ fn scan_claude_projects(
 ) -> Option<Vec<ModelDelta>> {
     let mut jsonl_files: Vec<PathBuf> = Vec::new();
     let now = std::time::SystemTime::now();
-    let Ok(project_entries) = std::fs::read_dir(projects_dir) else {
-        return None;
-    };
-    for proj in project_entries.flatten() {
-        let proj_path = proj.path();
-        if !proj_path.is_dir() {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(&proj_path) else {
-            continue;
-        };
-        for f in files.flatten() {
-            let p = f.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let is_recent = f
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|mt| now.duration_since(mt).ok())
-                .is_some_and(|age| age.as_secs() <= max_age_secs);
-            if is_recent {
-                jsonl_files.push(p);
-            }
-        }
-    }
+    collect_recent_claude_jsonl(projects_dir, 0, now, max_age_secs, &mut jsonl_files);
 
     if jsonl_files.is_empty() {
         return None;
     }
 
+    let is_cold_start = state.buckets.is_empty() && state.file_offsets.is_empty();
     let mut by_model: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
     for path in jsonl_files {
-        read_claude_jsonl_deltas(&path, state, &mut by_model);
+        read_claude_jsonl_deltas(&path, state, is_cold_start, &mut by_model);
     }
 
     Some(
@@ -202,6 +208,7 @@ fn scan_claude_projects(
 fn read_claude_jsonl_deltas(
     path: &Path,
     state: &mut CliToolState,
+    is_cold_start: bool,
     by_model: &mut HashMap<String, (u64, u64, u64, u64)>,
 ) {
     let Ok(mut file) = File::open(path) else {
@@ -213,7 +220,17 @@ fn read_claude_jsonl_deltas(
     let file_len = meta.len();
     let key = path.to_string_lossy().into_owned();
 
-    let mut offset = state.file_offsets.get(&key).copied().unwrap_or(0);
+    // On initial cold start (no prior state), start tailing existing transcripts
+    // from EOF so prior history is not dumped into the first interval.
+    // Once running, any newly discovered conversation file is read from offset 0.
+    let mut offset = match state.file_offsets.get(&key).copied() {
+        Some(off) => off,
+        None if is_cold_start => {
+            state.file_offsets.insert(key, file_len);
+            return;
+        }
+        None => 0,
+    };
     if offset > file_len {
         offset = 0;
     }
@@ -236,7 +253,11 @@ fn read_claude_jsonl_deltas(
         .file_offsets
         .insert(key, offset + (last_nl as u64) + 1);
 
+    // Deduplicate streaming lines by message.id (keep final entry per message)
+    // and skip incomplete streaming chunks where stop_reason is explicitly null.
     let text = String::from_utf8_lossy(&buf[..=last_nl]);
+    let mut deduped: HashMap<String, (String, u64, u64, u64)> = HashMap::new();
+    let mut anon_idx = 0usize;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -248,6 +269,11 @@ fn read_claude_jsonl_deltas(
         let Some(msg) = val.get("message") else {
             continue;
         };
+        if let Some(sr) = msg.get("stop_reason")
+            && sr.is_null()
+        {
+            continue;
+        }
         let Some(usage) = msg.get("usage") else {
             continue;
         };
@@ -275,12 +301,24 @@ fn read_claude_jsonl_deltas(
             .unwrap_or(0);
 
         if in_tok > 0 || out_tok > 0 || cached_tok > 0 {
-            let e = by_model.entry(model.to_string()).or_insert((0, 0, 0, 0));
-            e.0 = e.0.saturating_add(in_tok);
-            e.1 = e.1.saturating_add(out_tok);
-            e.2 = e.2.saturating_add(cached_tok);
-            e.3 = e.3.saturating_add(1);
+            let msg_key = msg
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    anon_idx += 1;
+                    format!("__anon_{anon_idx}")
+                });
+            deduped.insert(msg_key, (model.to_string(), in_tok, out_tok, cached_tok));
         }
+    }
+
+    for (_id, (model, in_tok, out_tok, cached_tok)) in deduped {
+        let e = by_model.entry(model).or_insert((0, 0, 0, 0));
+        e.0 = e.0.saturating_add(in_tok);
+        e.1 = e.1.saturating_add(out_tok);
+        e.2 = e.2.saturating_add(cached_tok);
+        e.3 = e.3.saturating_add(1);
     }
 }
 
