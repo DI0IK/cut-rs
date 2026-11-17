@@ -104,6 +104,8 @@ impl ClaudeStatusLinePayload {
             total_output_tokens,
             current_cached_tokens,
             total_cached_tokens: None,
+            precomputed_delta: None,
+            skip_emit: false,
             quotas,
             timestamp: now,
         }

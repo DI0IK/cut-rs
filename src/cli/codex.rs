@@ -285,6 +285,8 @@ fn process_rollout_line(
                     .map(|u| u.cached_input_tokens)
                     .unwrap_or(0),
                 total_cached_tokens: Some(totals.cached_input_tokens),
+                precomputed_delta: None,
+                skip_emit: false,
                 quotas,
                 timestamp: ts,
             };

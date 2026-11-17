@@ -67,9 +67,15 @@ pub struct CliToolState {
     pub buckets: HashMap<String, BucketTracker>,
     #[serde(default)]
     pub pending_intervals: Vec<IntervalSubmission>,
-    /// Incremental byte offsets for log-tailing adapters (e.g. codex-cli)
+    /// Incremental byte offsets for log-tailing adapters (e.g. codex-cli, agy-cli)
     #[serde(default)]
     pub file_offsets: HashMap<String, u64>,
+    /// Last observed subagent USD spend (for detecting unattributed subagent burn)
+    #[serde(default)]
+    pub last_subagent_usd: Option<f64>,
+    /// Discovered subagent transcript paths for the active session
+    #[serde(default)]
+    pub active_subagent_transcripts: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +97,10 @@ pub struct TickInput {
     pub current_cached_tokens: u64,
     /// Cumulative cached input tokens if the tool reports a monotonic total instead of per-turn
     pub total_cached_tokens: Option<u64>,
+    /// Optional precomputed per-tick deltas (in, out, cached_in, request_count) from transcript tailing
+    pub precomputed_delta: Option<(u64, u64, u64, u64)>,
+    /// When true, reset pending bucket usage and skip emitting an interval (e.g. unattributed subagent)
+    pub skip_emit: bool,
     pub quotas: Vec<QuotaSample>,
     pub timestamp: i64,
 }
@@ -170,6 +180,20 @@ pub async fn run_stdin_adapter<F>(
 ) where
     F: FnOnce(&str, i64) -> anyhow::Result<Option<TickInput>>,
 {
+    run_stdin_adapter_with_state(args, default_state_filename, |raw, _state, now| {
+        parse_tick(raw, now)
+    })
+    .await;
+}
+
+/// Shared runner for `stdin`-based `statusLine` adapters that also read/update `CliToolState`.
+pub async fn run_stdin_adapter_with_state<F>(
+    args: &CommonClientArgs,
+    default_state_filename: &str,
+    parse_tick: F,
+) where
+    F: FnOnce(&str, &mut CliToolState, i64) -> anyhow::Result<Option<TickInput>>,
+{
     let mut stdin_buf = String::new();
     if std::io::stdin().read_to_string(&mut stdin_buf).is_err() {
         return;
@@ -237,22 +261,22 @@ async fn run_stdin_adapter_inner<F>(
     parse_tick: F,
 ) -> anyhow::Result<()>
 where
-    F: FnOnce(&str, i64) -> anyhow::Result<Option<TickInput>>,
+    F: FnOnce(&str, &mut CliToolState, i64) -> anyhow::Result<Option<TickInput>>,
 {
     if stdin_buf.trim().is_empty() {
         return Ok(());
     }
-
-    let now = Utc::now().timestamp();
-    let Some(tick) = parse_tick(stdin_buf, now)? else {
-        return Ok(());
-    };
 
     let state_path = args
         .state_file
         .clone()
         .unwrap_or_else(|| default_state_file_path(default_state_filename));
     let mut state = load_state(&state_path).unwrap_or_default();
+
+    let now = Utc::now().timestamp();
+    let Some(tick) = parse_tick(stdin_buf, &mut state, now)? else {
+        return Ok(());
+    };
 
     let model_label = tick.model.clone().unwrap_or_else(|| "no-model".to_string());
     let emitted = apply_token_and_quota_tick(&mut state, &tick);
@@ -284,11 +308,20 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
     let counters_reset = tick.total_input_tokens < state.last_total_input_tokens
         || tick.total_output_tokens < state.last_total_output_tokens;
 
-    let (delta_in, delta_out, delta_cached) = if session_changed || counters_reset {
+    let (delta_in, delta_out, delta_cached, delta_reqs) = if let Some(d) = tick.precomputed_delta {
+        if session_changed {
+            state.session_id = Some(tick.session_id.clone());
+            state.active_subagent_transcripts.clear();
+            state.last_subagent_usd = None;
+        }
+        state.last_total_input_tokens = tick.total_input_tokens;
+        state.last_total_output_tokens = tick.total_output_tokens;
+        d
+    } else if session_changed || counters_reset {
         state.session_id = Some(tick.session_id.clone());
         state.last_total_input_tokens = tick.total_input_tokens;
         state.last_total_output_tokens = tick.total_output_tokens;
-        (0, 0, 0)
+        (0, 0, 0, 0)
     } else {
         let di = tick.total_input_tokens - state.last_total_input_tokens;
         let do_ = tick.total_output_tokens - state.last_total_output_tokens;
@@ -299,10 +332,16 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
         } else {
             0
         };
-        (di, do_, dc)
+        let reqs = if di > 0 || do_ > 0 || dc > 0 { 1 } else { 0 };
+        (di, do_, dc, reqs)
     };
 
-    if let Some(model_raw) = &tick.model {
+    if tick.skip_emit {
+        for tracker in state.buckets.values_mut() {
+            tracker.pending_usage.clear();
+            tracker.started_at = tick.timestamp;
+        }
+    } else if let Some(model_raw) = &tick.model {
         let model_name = normalize_key(model_raw);
         if !model_name.is_empty() && (delta_in > 0 || delta_out > 0 || delta_cached > 0) {
             for tracker in state.buckets.values_mut() {
@@ -319,7 +358,9 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
                 entry.tokens_in = entry.tokens_in.saturating_add(delta_in);
                 entry.tokens_out = entry.tokens_out.saturating_add(delta_out);
                 entry.tokens_cached_in = entry.tokens_cached_in.saturating_add(delta_cached);
-                entry.request_count = entry.request_count.saturating_add(1);
+                entry.request_count = entry
+                    .request_count
+                    .saturating_add(delta_reqs.max(1).min(u32::MAX as u64) as u32);
             }
         }
     }
@@ -370,7 +411,7 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
                 .map(|u| u.tokens_in + u.tokens_out + u.tokens_cached_in)
                 .sum();
 
-            if total_tokens > 0 && duration > 0 && duration <= 1800 {
+            if !tick.skip_emit && total_tokens > 0 && duration > 0 && duration <= 1800 {
                 let mut hasher = Sha256::new();
                 hasher.update(format!(
                     "{provider}:{}:{}:{}:{now}:{quota_after_pct:.6}",
