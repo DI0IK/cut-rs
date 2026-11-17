@@ -2,7 +2,16 @@
 
 A production-grade Rust backend service and local telemetry client that ingests crowdsourced AI quota consumption across providers and subscription tiers, estimates per-token quota costs (`tokens_in`, `tokens_out`, `tokens_cached_in`) in real time, resists Sybil poisoning, and detects silent provider pricing/quota shifts.
 
-Default public server: **`https://cut-rs.dominikstahl.dev`**
+Default public server & live dashboard: **`https://cut-rs.dominikstahl.dev`**
+
+---
+
+## Dashboard
+
+`cut-rs` serves an embedded React + TypeScript + Vite dashboard at `/` (bundled into the single binary via `rust-embed`):
+- **Quota Cost Timeline:** Compares models across sub-tiers and quota buckets over time using **Blended Mix** (weighted by the window's empirical crowdsourced `in / out / cached` token shares) or individual `OUT` / `IN` / `CACHED` breakdowns, with regime-shift markers.
+- **Active Model Weights & Predictor:** Displays `pct_per_1m_*` estimates with 95% confidence intervals, identifiability ratings, empirical cache rate, and an interactive Quota Predictor.
+- **Change Log:** Surfaces `regime_shift`, `model_added`, `model_retired`, `bucket_added`, and `bucket_retired` events.
 
 ---
 
@@ -29,7 +38,9 @@ All state and estimation are partitioned independently by `(provider, tier, wind
 | `GET` | `/v1/auth/challenge` | Public | Issue PoW challenge (`difficulty_bits`, 120s TTL) |
 | `POST` | `/v1/auth/register` | Public | Verify PoW and issue `qt_<uuid>.<sig>` bearer token |
 | `POST` | `/v1/telemetry/intervals` | Bearer | Ingest interval batches (partial-success status per item) |
+| `GET` | `/v1/estimates` | Public | List all discovered `(provider, tier, window_type)` partitions & empirical token mix |
 | `GET` | `/v1/estimates/{provider}/{tier}` | Public | Active model weights, 95% CIs, identifiability, change events (`?window_type=`, `?include_stale=`) |
+| `GET` | `/v1/estimates/{provider}/{tier}/history` | Public | Historical snapshot timeline (`tier=all` supported, `?window_type=`, `?limit=`) |
 | `POST` | `/v1/estimates/{provider}/{tier}/predict` | Public | Predict quota % hit and 95% prediction interval |
 
 ---
@@ -92,6 +103,9 @@ Options: `--provider <name>`, `--show-used`, `--server <url>`.
 
 ### Local Build & Tests
 ```bash
+# Build embedded dashboard assets (required once before cargo build/test)
+devenv shell -- bash -c "cd web && npm install && npm run build"
+
 devenv shell -- cargo build --release
 devenv shell -- cargo test
 devenv shell -- cargo clippy --all-targets -- -D warnings
