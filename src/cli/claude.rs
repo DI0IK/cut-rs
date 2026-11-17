@@ -132,6 +132,7 @@ impl ClaudeStatusLinePayload {
             precomputed_delta: None,
             multi_deltas,
             skip_emit: false,
+            quota_precision: None,
             quotas,
             timestamp: now,
         }

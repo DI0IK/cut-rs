@@ -290,6 +290,7 @@ fn process_rollout_line(
                 precomputed_delta: None,
                 multi_deltas: None,
                 skip_emit: false,
+                quota_precision: None,
                 quotas,
                 timestamp: ts,
             };

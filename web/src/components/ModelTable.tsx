@@ -21,6 +21,8 @@ function identifiabilityExplanation(level: ModelWeightEstimate["identifiability"
       return "Moderate: Blended cost is solid; individual weights are stabilizing as more varied turns arrive.";
     case "low_collinear":
       return "Low (collinear): Tokens move in a similar ratio across turns. Needs more low-cache / cold-start turns to separate In from Cached.";
+    case "insufficient_samples":
+      return "Insufficient samples (n < 15): Blended cost is usable as a rough guide; individual token weights are still stabilizing.";
   }
 }
 
@@ -37,7 +39,7 @@ export function ModelTable({ rows }: Props) {
         {rows.length === 0 ? (
           <div className="empty-state">No active model estimates yet.</div>
         ) : (
-          <table>
+          <table className="model-table">
             <thead>
               <tr>
                 <th>Model</th>
@@ -58,10 +60,16 @@ export function ModelTable({ rows }: Props) {
                 const impliedBlendedM = blended > 1e-6 ? 100 / blended : null;
                 const impliedOutM =
                   model.pct_per_1m_out > 1e-6 ? 100 / model.pct_per_1m_out : null;
+                const isUnidentifiable =
+                  model.identifiability === "insufficient_samples" ||
+                  model.identifiability === "low_collinear";
+                const atOutInBoundary =
+                  model.pct_per_1m_in > 1e-6 &&
+                  Math.abs(model.pct_per_1m_out - model.pct_per_1m_in) < 1e-4;
 
                 return (
                   <tr key={`${tier}-${windowType}-${model.model}`}>
-                    <td>
+                    <td data-label="Model">
                       <HoverCard
                         card={
                           <div className="hc-grid">
@@ -99,10 +107,10 @@ export function ModelTable({ rows }: Props) {
                         n={model.sample_count} · {tier}
                       </span>
                     </td>
-                    <td className="mono" style={{ fontSize: 12 }}>
+                    <td data-label="Bucket" className="mono" style={{ fontSize: 12 }}>
                       {windowType}
                     </td>
-                    <td className="num">
+                    <td data-label="Blended" className="num">
                       <HoverCard
                         align="right"
                         card={
@@ -132,28 +140,28 @@ export function ModelTable({ rows }: Props) {
                         <strong className="hc-trigger">{blended.toFixed(2)}%</strong>
                       </HoverCard>
                     </td>
-                    <td className="num">
+                    <td data-label="In" className="num" style={isUnidentifiable ? { opacity: 0.65 } : undefined}>
                       {model.pct_per_1m_in.toFixed(2)}%
                       <span className="ci-sub">
                         [{model.pct_per_1m_in_ci.lower.toFixed(2)}–
                         {model.pct_per_1m_in_ci.upper.toFixed(2)}]
                       </span>
                     </td>
-                    <td className="num">
+                    <td data-label="Out" className="num" style={isUnidentifiable ? { opacity: 0.65 } : undefined}>
                       {model.pct_per_1m_out.toFixed(2)}%
                       <span className="ci-sub">
                         [{model.pct_per_1m_out_ci.lower.toFixed(2)}–
                         {model.pct_per_1m_out_ci.upper.toFixed(2)}]
                       </span>
                     </td>
-                    <td className="num">
+                    <td data-label="Cached" className="num" style={isUnidentifiable ? { opacity: 0.65 } : undefined}>
                       {model.pct_per_1m_cached_in.toFixed(2)}%
                       <span className="ci-sub">
                         [{model.pct_per_1m_cached_in_ci.lower.toFixed(2)}–
                         {model.pct_per_1m_cached_in_ci.upper.toFixed(2)}]
                       </span>
                     </td>
-                    <td>
+                    <td data-label="Identifiability">
                       <HoverCard
                         align="right"
                         card={
@@ -162,6 +170,11 @@ export function ModelTable({ rows }: Props) {
                             <div className="hc-desc">
                               {identifiabilityExplanation(model.identifiability)}
                             </div>
+                            {atOutInBoundary && (
+                              <div className="hc-desc" style={{ marginTop: 6 }}>
+                                Note: Out = In (hit monotonic NNLS boundary w_out &gt;= w_in).
+                              </div>
+                            )}
                           </div>
                         }
                       >

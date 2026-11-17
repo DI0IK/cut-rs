@@ -17,10 +17,11 @@ export interface ModelWeightEstimate {
   pct_per_1m_out_ci: ConfidenceInterval;
   pct_per_1m_cached_in: number;
   pct_per_1m_cached_in_ci: ConfidenceInterval;
-  identifiability: "high" | "moderate" | "low_collinear";
+  identifiability: "high" | "moderate" | "low_collinear" | "insufficient_samples";
   sample_count: number;
   last_seen_at: number;
   status: "active" | "retired";
+  token_mix?: TokenMix;
 }
 
 export interface ChangeEvent {

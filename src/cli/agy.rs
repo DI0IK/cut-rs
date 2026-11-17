@@ -150,6 +150,7 @@ impl StatusLinePayload {
             }
         }
 
+        let mut unattributed_sibling = false;
         let mut idx = 0;
         while idx < candidate_paths.len() {
             let path = candidate_paths[idx].clone();
@@ -168,7 +169,13 @@ impl StatusLinePayload {
                 });
 
             let Some(model_name) = model_opt else {
-                // Defer unseen sibling tabs until their own statusLine records their model
+                // Defer unseen sibling tabs until their own statusLine records their model,
+                // but flag if they already logged model usage so we don't emit a poisoned interval.
+                if let Some((di, do_, dc, _)) = read_transcript_deltas_inner(&path, state, false, false)
+                    && (di > 0 || do_ > 0 || dc > 0)
+                {
+                    unattributed_sibling = true;
+                }
                 continue;
             };
 
@@ -228,7 +235,8 @@ impl StatusLinePayload {
         }
 
         let subagent_detected = !self.subagents.is_empty() || subagent_usd_increased;
-        let skip_emit = subagent_detected && state.active_subagent_transcripts.is_empty();
+        let skip_emit = (subagent_detected && state.active_subagent_transcripts.is_empty())
+            || unattributed_sibling;
 
         TickInput {
             session_id,
@@ -242,6 +250,7 @@ impl StatusLinePayload {
             precomputed_delta: None,
             multi_deltas,
             skip_emit,
+            quota_precision: Some(0.0001),
             quotas,
             timestamp: now,
         }
@@ -254,6 +263,15 @@ fn read_transcript_deltas(
     path: &Path,
     state: &mut CliToolState,
     discover_subagents: bool,
+) -> Option<(u64, u64, u64, u64)> {
+    read_transcript_deltas_inner(path, state, discover_subagents, true)
+}
+
+fn read_transcript_deltas_inner(
+    path: &Path,
+    state: &mut CliToolState,
+    discover_subagents: bool,
+    advance_offset: bool,
 ) -> Option<(u64, u64, u64, u64)> {
     let mut file = File::open(path).ok()?;
     let file_len = file.metadata().ok()?.len();
@@ -276,9 +294,11 @@ fn read_transcript_deltas(
     };
 
     let complete_slice = &buf[..=last_nl];
-    state
-        .file_offsets
-        .insert(key, offset + (last_nl as u64) + 1);
+    if advance_offset {
+        state
+            .file_offsets
+            .insert(key, offset + (last_nl as u64) + 1);
+    }
 
     let text = String::from_utf8_lossy(complete_slice);
     let mut tok_in = 0u64;

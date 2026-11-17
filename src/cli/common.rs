@@ -115,6 +115,8 @@ pub struct TickInput {
     pub multi_deltas: Option<Vec<ModelDelta>>,
     /// When true, reset pending bucket usage and skip emitting an interval (e.g. unattributed subagent)
     pub skip_emit: bool,
+    /// Optional provider-specific quota precision in percentage points (defaults to 0.01)
+    pub quota_precision: Option<f64>,
     pub quotas: Vec<QuotaSample>,
     pub timestamp: i64,
 }
@@ -497,7 +499,7 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
                     ended_at: now,
                     quota_before_pct,
                     quota_after_pct,
-                    quota_precision: 0.01,
+                    quota_precision: tick.quota_precision.unwrap_or(0.01),
                     usage,
                 });
                 emitted += 1;

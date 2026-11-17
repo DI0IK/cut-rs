@@ -114,6 +114,7 @@ pub enum Identifiability {
     High,
     Moderate,
     LowCollinear,
+    InsufficientSamples,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +143,8 @@ pub struct ModelWeightEstimate {
     pub sample_count: usize,
     pub last_seen_at: i64,
     pub status: ModelStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_mix: Option<TokenMix>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

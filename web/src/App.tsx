@@ -141,7 +141,7 @@ export function App() {
         view.models.map((m) => ({
           tier: t,
           windowType: view.window_type,
-          mix: view.token_mix,
+          mix: m.token_mix ?? view.token_mix,
           sigmaHat: view.sigma_hat,
           model: m,
         }))

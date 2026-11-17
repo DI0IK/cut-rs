@@ -154,7 +154,15 @@ pub fn fit_irls_nnls(
 
         let preds = &x * &w_vec;
         let residuals: Vec<f64> = (0..n).map(|i| y[i] - preds[i]).collect();
-        let mad = compute_mad(&residuals).max(1e-4);
+        // Scale residuals by predicted magnitude (floored by quota_precision) so Huber
+        // handles heteroscedastic turns without over-penalizing large valid intervals.
+        let rel_residuals: Vec<f64> = (0..n)
+            .map(|i| {
+                let scale = preds[i].abs().max(intervals[i].quota_precision).max(1e-4);
+                residuals[i] / scale
+            })
+            .collect();
+        let mad = compute_mad(&rel_residuals).max(1e-4);
 
         // Asymmetric Huber: tighter clipping on positive residuals (unlogged usage on another device)
         let delta_pos = 0.8 * mad;
@@ -162,7 +170,7 @@ pub fn fit_irls_nnls(
 
         let mut reweighted = Vec::with_capacity(n);
         for i in 0..n {
-            let r = residuals[i];
+            let r = rel_residuals[i];
             let huber = if r > 0.0 {
                 if r <= delta_pos { 1.0 } else { delta_pos / r }
             } else {
@@ -231,11 +239,24 @@ pub fn fit_irls_nnls(
         }
     }
 
-    // Condition number of X^T X (column-scaled to avoid unit scale distortion)
-    let global_cond = compute_condition_number(&x);
+    // Column-normalized, data-driven ridge-damped inverse of (X^T W X) for stable CIs
+    // without hardcoding any token cost ratios.
+    let mut col_scale = vec![1.0_f64; p];
+    for j in 0..p {
+        col_scale[j] = xtwx[(j, j)].sqrt().max(1e-6);
+    }
+    let mut xtwx_norm = DMatrix::zeros(p, p);
+    for j in 0..p {
+        for k in 0..p {
+            xtwx_norm[(j, k)] = xtwx[(j, k)] / (col_scale[j] * col_scale[k]);
+        }
+    }
+    let ridge = (1.0 / n_eff.max(1.0)).clamp(1e-4, 0.05);
+    for j in 0..p {
+        xtwx_norm[(j, j)] += ridge;
+    }
 
-    // Pseudo-inverse via SVD for Sigma_w
-    let svd = xtwx.svd(true, true);
+    let svd = xtwx_norm.svd(true, true);
     let mut inv_xtwx = DMatrix::zeros(p, p);
     if let (Some(u), Some(v_t)) = (&svd.u, &svd.v_t) {
         let max_sv = svd.singular_values.iter().cloned().fold(0.0_f64, f64::max);
@@ -247,7 +268,12 @@ pub fn fit_irls_nnls(
                 s_inv[(i, i)] = 1.0 / sv;
             }
         }
-        inv_xtwx = v_t.transpose() * s_inv * u.transpose();
+        let inv_norm = v_t.transpose() * s_inv * u.transpose();
+        for j in 0..p {
+            for k in 0..p {
+                inv_xtwx[(j, k)] = inv_norm[(j, k)] / (col_scale[j] * col_scale[k]);
+            }
+        }
     }
 
     let cov = &inv_xtwx * sigma_sq;
@@ -271,16 +297,16 @@ pub fn fit_irls_nnls(
         let sample_count = *model_counts.get(model_name).unwrap_or(&0);
         let last_seen_at = *model_last_seen.get(model_name).unwrap_or(&now);
 
-        // Identifiability based on sample count, column leverage/variance, and condition number
+        // Identifiability based on per-model sample count, column leverage/variance, and condition number
         let col_norm_in = x.column(base).norm();
         let col_norm_out = x.column(base + 1).norm();
-        let identifiability = if col_norm_in < 1e-6
-            || col_norm_out < 1e-6
-            || global_cond > 1_000.0
-            || sample_count < 15
-        {
+        let model_sub = x.columns(base, 3).into_owned();
+        let model_cond = compute_condition_number(&model_sub);
+        let identifiability = if sample_count < 15 {
+            Identifiability::InsufficientSamples
+        } else if col_norm_in < 1e-6 || col_norm_out < 1e-6 || model_cond > 1_000.0 {
             Identifiability::LowCollinear
-        } else if global_cond > 100.0 || sample_count < 30 {
+        } else if model_cond > 100.0 || sample_count < 30 {
             Identifiability::Moderate
         } else {
             Identifiability::High
@@ -291,6 +317,7 @@ pub fn fit_irls_nnls(
         } else {
             ModelStatus::Active
         };
+        let model_mix = compute_model_token_mix(&weights, intervals, model_name);
 
         models.push(ModelWeightEstimate {
             model: model_name.clone(),
@@ -313,6 +340,7 @@ pub fn fit_irls_nnls(
             sample_count,
             last_seen_at,
             status,
+            token_mix: Some(model_mix),
         });
     }
 
@@ -410,6 +438,22 @@ pub fn enforce_client_cap(
 }
 
 pub fn compute_token_mix(weights: &[f64], intervals: &[IntervalRecord]) -> TokenMix {
+    compute_token_mix_filtered(weights, intervals, None)
+}
+
+pub fn compute_model_token_mix(
+    weights: &[f64],
+    intervals: &[IntervalRecord],
+    model_name: &str,
+) -> TokenMix {
+    compute_token_mix_filtered(weights, intervals, Some(model_name))
+}
+
+fn compute_token_mix_filtered(
+    weights: &[f64],
+    intervals: &[IntervalRecord],
+    model_filter: Option<&str>,
+) -> TokenMix {
     let mut sum_in = 0.0;
     let mut sum_out = 0.0;
     let mut sum_cached = 0.0;
@@ -417,6 +461,11 @@ pub fn compute_token_mix(weights: &[f64], intervals: &[IntervalRecord]) -> Token
     for (i, iv) in intervals.iter().enumerate() {
         let w = weights[i].max(0.0);
         for u in &iv.usage {
+            if let Some(target) = model_filter
+                && u.model.trim().to_ascii_lowercase() != target
+            {
+                continue;
+            }
             sum_in += w * (u.tokens_in as f64);
             sum_out += w * (u.tokens_out as f64);
             sum_cached += w * (u.tokens_cached_in as f64);
@@ -648,5 +697,10 @@ mod tests {
         assert!(m.pct_per_1m_out >= m.pct_per_1m_in);
         assert!(m.pct_per_1m_in >= m.pct_per_1m_cached_in);
         assert!(m.pct_per_1m_cached_in > 0.0);
+        assert_eq!(m.identifiability, Identifiability::InsufficientSamples);
+        let mix = m.token_mix.expect("per-model token_mix should be populated");
+        assert!((mix.in_share + mix.out_share + mix.cached_share - 1.0).abs() < 1e-6);
+        assert!(m.pct_per_1m_in_ci.upper.is_finite() && m.pct_per_1m_in_ci.upper < 100.0);
+        assert!(m.pct_per_1m_out_ci.upper.is_finite() && m.pct_per_1m_out_ci.upper < 100.0);
     }
 }

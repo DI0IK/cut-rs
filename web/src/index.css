@@ -226,13 +226,11 @@ body {
 
 .hover-card {
   display: none;
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 40;
+  position: fixed;
+  z-index: 9999;
   width: max-content;
   min-width: 210px;
-  max-width: min(290px, calc(100vw - 32px));
+  max-width: min(290px, calc(100vw - 24px));
   padding: 10px 12px;
   background: var(--surface);
   color: var(--ink);
@@ -246,20 +244,8 @@ body {
   white-space: normal;
 }
 
-.hover-card.align-right {
-  left: auto;
-  right: 0;
-}
-
-.hover-anchor.is-open > .hover-card,
-.hover-anchor:focus-within > .hover-card {
+.hover-card.is-portal-open {
   display: block;
-}
-
-@media (hover: hover) {
-  .hover-anchor:hover > .hover-card {
-    display: block;
-  }
 }
 
 .hc-grid {
@@ -389,6 +375,8 @@ body {
   margin-top: 16px;
   background: var(--surface);
   border: 1px solid var(--border);
+  min-width: 0;
+  max-width: 100%;
 }
 
 .panel-head {
@@ -422,6 +410,10 @@ body {
   margin-top: 16px;
 }
 
+.grid-2 > * {
+  min-width: 0;
+}
+
 @media (max-width: 900px) {
   .grid-2 {
     grid-template-columns: 1fr;
@@ -429,7 +421,72 @@ body {
 }
 
 .table-wrap {
+  width: 100%;
+  max-width: 100%;
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media (max-width: 720px) {
+  .table-wrap {
+    overflow-x: visible;
+  }
+
+  .model-table thead {
+    display: none;
+  }
+
+  .model-table,
+  .model-table tbody,
+  .model-table tr,
+  .model-table td {
+    display: block;
+    width: 100%;
+  }
+
+  .model-table tr {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .model-table tr:last-child {
+    border-bottom: none;
+  }
+
+  .model-table td {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 4px 0;
+    border-bottom: none;
+    text-align: right;
+  }
+
+  .model-table td::before {
+    content: attr(data-label);
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ink-muted);
+    text-align: left;
+    flex-shrink: 0;
+  }
+
+  .model-table td[data-label="Model"] {
+    flex-direction: column;
+    align-items: flex-start;
+    text-align: left;
+    padding-bottom: 6px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .model-table td[data-label="Model"]::before {
+    display: none;
+  }
 }
 
 table {
@@ -498,6 +555,12 @@ tr:last-child td {
   color: var(--crit);
   border-color: #fecaca;
   background: #fef2f2;
+}
+
+.badge.insufficient_samples {
+  color: var(--warn);
+  border-color: #fde68a;
+  background: #fffbeb;
 }
 
 .predictor-form {
