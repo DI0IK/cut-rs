@@ -176,15 +176,25 @@ pub fn fit_irls_nnls(
             .collect();
         let mad = compute_mad(&rel_residuals).max(1e-4);
 
-        // Asymmetric Huber: tighter clipping on positive residuals (unlogged usage on another device)
+        // Asymmetric Huber: tighter clipping on positive residuals (unlogged usage on another device).
+        // After 5 Huber warmup iterations (when n >= 10), redescend extreme positive outliers
+        // (e.g. transient reservation spikes) to 1e-4 so high-leverage spikes cannot pull weights.
         let delta_pos = 0.8 * mad;
         let delta_neg = 1.345 * mad;
+        let use_tukey_pos = _iter >= 5 && n >= 10;
+        let tukey_pos_cutoff = 4.0 * mad.max(0.05);
 
         let mut reweighted = Vec::with_capacity(n);
         for i in 0..n {
             let r = rel_residuals[i];
             let huber = if r > 0.0 {
-                if r <= delta_pos { 1.0 } else { delta_pos / r }
+                if use_tukey_pos && r > tukey_pos_cutoff && residuals[i] > 0.05 {
+                    1e-4
+                } else if r <= delta_pos {
+                    1.0
+                } else {
+                    delta_pos / r
+                }
             } else {
                 let abs_r = -r;
                 if abs_r <= delta_neg {
@@ -198,7 +208,7 @@ pub fn fit_irls_nnls(
 
         weights = enforce_client_cap(&reweighted, intervals, CLIENT_CAP_FRAC);
 
-        if diff < IRLS_TOL && _iter > 0 {
+        if diff < IRLS_TOL && _iter > 0 && (n < 10 || _iter >= 6) {
             break;
         }
     }
