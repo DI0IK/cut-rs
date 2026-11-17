@@ -490,9 +490,58 @@ async fn load_conversation_parents(summaries_db: &Path) -> HashMap<String, Strin
     map
 }
 
-/// Decodes top-level protobuf wire fields from `gen_metadata.data` and extracts
-/// field 21 (length-delimited UTF-8 model display string, e.g. `"Gemini 4 Hydrogen (Medium)"`).
+/// Decodes protobuf wire fields from `gen_metadata.data` and extracts field 21
+/// (either top-level or nested inside top-level submessage field 1, i.e. `.1.21`),
+/// which holds the UTF-8 model display string (e.g. `"Gemini 4 Hydrogen (Medium)"`).
 pub fn extract_model_from_gen_metadata_blob(blob: &[u8]) -> Option<String> {
+    if let Some(m) = extract_field_21_utf8(blob) {
+        return Some(m);
+    }
+    // Check nested submessage in top-level field 1 (.1.21)
+    let mut i = 0usize;
+    while i < blob.len() {
+        let (tag, next) = read_varint(blob, i)?;
+        i = next;
+        let field_num = tag >> 3;
+        let wire_type = tag & 0x7;
+        match wire_type {
+            0 => {
+                let (_, n) = read_varint(blob, i)?;
+                i = n;
+            }
+            1 => {
+                i = i.checked_add(8)?;
+                if i > blob.len() {
+                    return None;
+                }
+            }
+            2 => {
+                let (len, n) = read_varint(blob, i)?;
+                i = n;
+                let end = i.checked_add(len as usize)?;
+                if end > blob.len() {
+                    return None;
+                }
+                if field_num == 1
+                    && let Some(m) = extract_field_21_utf8(&blob[i..end])
+                {
+                    return Some(m);
+                }
+                i = end;
+            }
+            5 => {
+                i = i.checked_add(4)?;
+                if i > blob.len() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn extract_field_21_utf8(blob: &[u8]) -> Option<String> {
     let mut i = 0usize;
     while i < blob.len() {
         let (tag, next) = read_varint(blob, i)?;
@@ -562,13 +611,21 @@ mod tests {
 
     #[test]
     fn test_extract_model_from_gen_metadata_blob_field_21() {
-        // Field 1 (varint = 42), then Field 21 (wire type 2 = 0xAA 0x01) "Gemini 4 Hydrogen (Medium)"
+        // Top-level Field 21
         let mut blob = vec![0x08, 42, 0xAA, 0x01];
         let model = b"Gemini 4 Hydrogen (Medium)";
         blob.push(model.len() as u8);
         blob.extend_from_slice(model);
         assert_eq!(
             extract_model_from_gen_metadata_blob(&blob).as_deref(),
+            Some("Gemini 4 Hydrogen (Medium)")
+        );
+
+        // Nested inside top-level Field 1 (.1.21)
+        let mut nested = vec![0x0A, blob.len() as u8];
+        nested.extend_from_slice(&blob);
+        assert_eq!(
+            extract_model_from_gen_metadata_blob(&nested).as_deref(),
             Some("Gemini 4 Hydrogen (Medium)")
         );
     }
