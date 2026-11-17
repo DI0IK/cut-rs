@@ -24,6 +24,7 @@ export function App() {
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [showSetup, setShowSetup] = useState(false);
   const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
+  const [onlyRegimeEvents, setOnlyRegimeEvents] = useState(false);
 
   const copyCommand = (id: string, text: string) => {
     navigator.clipboard?.writeText(text);
@@ -149,10 +150,13 @@ export function App() {
     [windowsByTier]
   );
 
-  const uniqueModelNames = useMemo(
-    () => Array.from(new Set(modelRows.map((r) => r.model.model))).sort(),
-    [modelRows]
-  );
+  const uniqueModelNames = useMemo(() => {
+    const active = modelRows
+      .filter((r) => r.model.status === "active")
+      .map((r) => r.model.model);
+    const pool = active.length > 0 ? active : modelRows.map((r) => r.model.model);
+    return Array.from(new Set(pool)).sort();
+  }, [modelRows]);
 
   const totalSamples = useMemo(
     () => windowsByTier.reduce((acc, w) => acc + w.view.sample_count_window, 0),
@@ -194,13 +198,14 @@ export function App() {
     const map = new Map<string, ChangeEvent>();
     for (const { view } of windowsByTier) {
       for (const ev of view.recent_change_events) {
+        if (onlyRegimeEvents && ev.event_type !== "regime_shift") continue;
         map.set(`${ev.timestamp}-${ev.event_type}-${ev.description}`, ev);
       }
     }
     return Array.from(map.values())
       .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, 12);
-  }, [windowsByTier]);
+      .slice(0, 30);
+  }, [windowsByTier, onlyRegimeEvents]);
 
   return (
     <div className="shell">
@@ -376,11 +381,27 @@ export function App() {
       <section className="panel">
         <div className="panel-head">
           <span className="panel-title">Change Events & Regime Shifts</span>
+          <div className="controls">
+            <button
+              type="button"
+              className={`btn btn-sm ${!onlyRegimeEvents ? "active" : ""}`}
+              onClick={() => setOnlyRegimeEvents(false)}
+            >
+              All
+            </button>
+            <button
+              type="button"
+              className={`btn btn-sm ${onlyRegimeEvents ? "active" : ""}`}
+              onClick={() => setOnlyRegimeEvents(true)}
+            >
+              Regime shifts
+            </button>
+          </div>
         </div>
         <div className="panel-body">
           {recentEvents.length === 0 ? (
             <div className="empty-state" style={{ padding: 16 }}>
-              No change events recorded yet.
+              {onlyRegimeEvents ? "No regime shifts recorded yet." : "No change events recorded yet."}
             </div>
           ) : (
             <ul className="events-list">
