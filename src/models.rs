@@ -165,6 +165,23 @@ pub struct ChangeEvent {
     pub p_value: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TokenMix {
+    pub in_share: f64,
+    pub out_share: f64,
+    pub cached_share: f64,
+}
+
+impl Default for TokenMix {
+    fn default() -> Self {
+        Self {
+            in_share: 0.05,
+            out_share: 0.05,
+            cached_share: 0.90,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotPayload {
     pub provider: String,
@@ -176,6 +193,8 @@ pub struct SnapshotPayload {
     pub effective_contributors: f64,
     pub sigma_hat: f64,
     pub stale: bool,
+    #[serde(default)]
+    pub token_mix: TokenMix,
     pub models: Vec<ModelWeightEstimate>,
     pub feature_names: Vec<String>,
     pub covariance_matrix: Vec<f64>,

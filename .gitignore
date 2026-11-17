@@ -15,3 +15,7 @@ devenv.local.yaml
 /target
 result
 cut_rs.db*
+
+# Web build artifacts
+/web/node_modules
+/web/dist

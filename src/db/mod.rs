@@ -55,4 +55,12 @@ pub trait TelemetryRepository: Send + Sync {
     async fn save_snapshot(&self, snapshot: &SnapshotPayload) -> Result<(), AppError>;
 
     async fn load_latest_snapshots(&self) -> Result<Vec<SnapshotPayload>, AppError>;
+
+    async fn load_snapshot_history(
+        &self,
+        provider: &str,
+        tier: Option<&str>,
+        window_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SnapshotPayload>, AppError>;
 }

@@ -277,6 +277,7 @@ pub async fn process_partition(
         effective_contributors: fit.effective_contributors,
         sigma_hat: fit.sigma_hat,
         stale,
+        token_mix: fit.token_mix,
         models: fit.models,
         feature_names: fit.feature_names,
         covariance_matrix: fit.covariance_matrix,

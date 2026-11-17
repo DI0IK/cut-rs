@@ -349,4 +349,40 @@ impl TelemetryRepository for SqliteRepository {
         }
         Ok(out)
     }
+
+    async fn load_snapshot_history(
+        &self,
+        provider: &str,
+        tier: Option<&str>,
+        window_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SnapshotPayload>, AppError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT weights_json
+            FROM model_snapshots
+            WHERE provider = ?1
+              AND (?2 IS NULL OR tier = ?2)
+              AND (?3 IS NULL OR window_type = ?3)
+            ORDER BY computed_at DESC, id DESC
+            LIMIT ?4
+            "#,
+        )
+        .bind(provider)
+        .bind(tier)
+        .bind(window_type)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let json_str: String = r.get("weights_json");
+            let snap: SnapshotPayload = serde_json::from_str(&json_str)
+                .map_err(|e| AppError::Internal(e.into()))?;
+            out.push(snap);
+        }
+        out.reverse();
+        Ok(out)
+    }
 }

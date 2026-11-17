@@ -213,5 +213,31 @@ async fn test_end_to_end_auth_ingest_estimate_predict_and_bucket_migration() {
     assert!(pred["ci_95_lower"].as_f64().unwrap() <= expected);
     assert!(pred["ci_95_upper"].as_f64().unwrap() >= expected);
 
+    // 8. Query GET /v1/estimates (partition index), /history, and GET / (dashboard HTML)
+    let index: Value = client
+        .get(format!("{base}/v1/estimates"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(index["partitions"].as_array().unwrap().len(), 2);
+
+    let hist: Value = client
+        .get(format!("{base}/v1/estimates/antigravity/all/history"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hist["points"].as_array().unwrap().len(), 2);
+
+    let html_resp = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(html_resp.status(), 200);
+    let html = html_resp.text().await.unwrap();
+    assert!(html.contains("<div id=\"root\"></div>"));
+
     server_handle.abort();
 }

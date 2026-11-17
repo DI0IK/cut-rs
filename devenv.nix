@@ -7,6 +7,6 @@
 }:
 
 {
-  packages = [ pkgs.git ];
+  packages = [ pkgs.git pkgs.nodejs ];
   languages.rust.enable = true;
 }

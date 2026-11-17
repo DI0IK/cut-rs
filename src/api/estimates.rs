@@ -1,7 +1,8 @@
 use crate::api::AppState;
 use crate::error::AppError;
 use crate::models::{
-    ChangeEvent, ModelStatus, ModelWeightEstimate, SnapshotPayload, UsageEntry, normalize_key,
+    ChangeEvent, ModelStatus, ModelWeightEstimate, SnapshotPayload, TokenMix, UsageEntry,
+    normalize_key,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -24,9 +25,144 @@ pub struct WindowEstimateView {
     pub regime_since: i64,
     pub sample_count_window: usize,
     pub effective_contributors: f64,
+    pub sigma_hat: f64,
     pub stale: bool,
+    pub token_mix: TokenMix,
     pub models: Vec<ModelWeightEstimate>,
     pub recent_change_events: Vec<ChangeEvent>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PartitionSummary {
+    pub provider: String,
+    pub tier: String,
+    pub window_type: String,
+    pub sample_count_window: usize,
+    pub effective_contributors: f64,
+    pub token_mix: TokenMix,
+    pub stale: bool,
+    pub computed_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PartitionsResponse {
+    pub partitions: Vec<PartitionSummary>,
+}
+
+pub async fn list_partitions(State(state): State<AppState>) -> Json<PartitionsResponse> {
+    let mut partitions: Vec<PartitionSummary> = state
+        .cache
+        .iter()
+        .map(|entry| {
+            let s = entry.value();
+            PartitionSummary {
+                provider: s.provider.clone(),
+                tier: s.tier.clone(),
+                window_type: s.window_type.clone(),
+                sample_count_window: s.sample_count_window,
+                effective_contributors: s.effective_contributors,
+                token_mix: s.token_mix,
+                stale: s.stale,
+                computed_at: s.computed_at,
+            }
+        })
+        .collect();
+
+    partitions.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then(a.tier.cmp(&b.tier))
+            .then(a.window_type.cmp(&b.window_type))
+    });
+
+    Json(PartitionsResponse { partitions })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryQuery {
+    pub window_type: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HistoryModelPoint {
+    pub model: String,
+    pub pct_per_1m_in: f64,
+    pub pct_per_1m_out: f64,
+    pub pct_per_1m_cached_in: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HistorySnapshotPoint {
+    pub tier: String,
+    pub window_type: String,
+    pub computed_at: i64,
+    pub regime_since: i64,
+    pub sample_count_window: usize,
+    pub effective_contributors: f64,
+    pub token_mix: TokenMix,
+    pub models: Vec<HistoryModelPoint>,
+    pub recent_change_events: Vec<ChangeEvent>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HistoryResponse {
+    pub provider: String,
+    pub tier: String,
+    pub points: Vec<HistorySnapshotPoint>,
+}
+
+pub async fn get_estimates_history(
+    State(state): State<AppState>,
+    Path((provider, tier)): Path<(String, String)>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<HistoryResponse>, AppError> {
+    let provider_norm = normalize_key(&provider);
+    let tier_norm = normalize_key(&tier);
+    let tier_filter = if tier_norm == "all" || tier_norm == "*" {
+        None
+    } else {
+        Some(tier_norm.as_str())
+    };
+    let wt_norm = query.window_type.as_deref().map(normalize_key);
+    let wt_filter = wt_norm.as_deref().filter(|w| *w != "all" && *w != "*");
+    let limit = query.limit.unwrap_or(180).clamp(1, 500);
+
+    let snaps = state
+        .repo
+        .load_snapshot_history(&provider_norm, tier_filter, wt_filter, limit)
+        .await?;
+
+    let points = snaps
+        .into_iter()
+        .map(|s| HistorySnapshotPoint {
+            tier: s.tier,
+            window_type: s.window_type,
+            computed_at: s.computed_at,
+            regime_since: s.regime_since,
+            sample_count_window: s.sample_count_window,
+            effective_contributors: s.effective_contributors,
+            token_mix: s.token_mix,
+            models: s
+                .models
+                .into_iter()
+                .filter(|m| m.status == ModelStatus::Active)
+                .map(|m| HistoryModelPoint {
+                    model: m.model,
+                    pct_per_1m_in: m.pct_per_1m_in,
+                    pct_per_1m_out: m.pct_per_1m_out,
+                    pct_per_1m_cached_in: m.pct_per_1m_cached_in,
+                })
+                .collect(),
+            recent_change_events: s.recent_change_events,
+        })
+        .collect();
+
+    Ok(Json(HistoryResponse {
+        provider: provider_norm,
+        tier: tier_norm,
+        points,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -73,7 +209,9 @@ pub async fn get_estimates(
             regime_since: snap.regime_since,
             sample_count_window: snap.sample_count_window,
             effective_contributors: snap.effective_contributors,
+            sigma_hat: snap.sigma_hat,
             stale: snap.stale,
+            token_mix: snap.token_mix,
             models: active_models,
             recent_change_events: snap.recent_change_events.clone(),
         });

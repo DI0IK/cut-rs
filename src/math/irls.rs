@@ -1,7 +1,7 @@
 use crate::math::nnls::solve_nnls;
 use crate::models::{
     ClientRecord, ConfidenceInterval, Identifiability, IntervalRecord, ModelStatus,
-    ModelWeightEstimate,
+    ModelWeightEstimate, TokenMix,
 };
 use nalgebra::{DMatrix, DVector};
 use statrs::distribution::{ContinuousCDF, StudentsT};
@@ -20,6 +20,7 @@ pub struct IrlsFitResult {
     pub covariance_matrix: Vec<f64>,
     pub sigma_hat: f64,
     pub effective_contributors: f64,
+    pub token_mix: TokenMix,
     pub residuals: Vec<f64>,
     pub assigned_weights: Vec<f64>,
 }
@@ -170,6 +171,7 @@ pub fn fit_irls_nnls(
     let residuals: Vec<f64> = (0..n).map(|i| y[i] - preds[i]).collect();
 
     let effective_contributors = compute_effective_contributors(&weights, intervals);
+    let token_mix = compute_token_mix(&weights, intervals);
 
     // 5. Uncertainty & Covariance: Sigma_w = sigma_hat^2 * (X_active^T W X_active)^-1
     let sum_w: f64 = weights.iter().sum();
@@ -311,6 +313,7 @@ pub fn fit_irls_nnls(
         covariance_matrix,
         sigma_hat,
         effective_contributors,
+        token_mix,
         residuals,
         assigned_weights: weights,
     })
@@ -387,6 +390,31 @@ pub fn enforce_client_cap(
             raw_weights[i] * s
         })
         .collect()
+}
+
+pub fn compute_token_mix(weights: &[f64], intervals: &[IntervalRecord]) -> TokenMix {
+    let mut sum_in = 0.0;
+    let mut sum_out = 0.0;
+    let mut sum_cached = 0.0;
+
+    for (i, iv) in intervals.iter().enumerate() {
+        let w = weights[i].max(0.0);
+        for u in &iv.usage {
+            sum_in += w * (u.tokens_in as f64);
+            sum_out += w * (u.tokens_out as f64);
+            sum_cached += w * (u.tokens_cached_in as f64);
+        }
+    }
+
+    let total = sum_in + sum_out + sum_cached;
+    if total <= 0.0 {
+        return TokenMix::default();
+    }
+    TokenMix {
+        in_share: sum_in / total,
+        out_share: sum_out / total,
+        cached_share: sum_cached / total,
+    }
 }
 
 pub fn compute_effective_contributors(weights: &[f64], intervals: &[IntervalRecord]) -> f64 {

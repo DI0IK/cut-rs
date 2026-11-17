@@ -11,11 +11,13 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
 use dashmap::DashMap;
+use rust_embed::RustEmbed;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
@@ -76,6 +78,43 @@ async fn rate_limit_middleware(
     Ok(next.run(req).await)
 }
 
+#[derive(RustEmbed)]
+#[folder = "web/dist"]
+struct WebAssets;
+
+async fn serve_dashboard(uri: Uri) -> Response {
+    let raw_path = uri.path().trim_start_matches('/');
+    if raw_path == "v1" || raw_path.starts_with("v1/") {
+        return AppError::NotFound("endpoint not found".to_string()).into_response();
+    }
+
+    let path = if raw_path.is_empty() {
+        "index.html"
+    } else {
+        raw_path
+    };
+
+    if let Some(file) = WebAssets::get(path) {
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        let mut resp = (StatusCode::OK, file.data.into_owned()).into_response();
+        if let Ok(val) = HeaderValue::from_str(mime.as_ref()) {
+            resp.headers_mut().insert(header::CONTENT_TYPE, val);
+        }
+        return resp;
+    }
+
+    if let Some(index) = WebAssets::get("index.html") {
+        let mut resp = (StatusCode::OK, index.data.into_owned()).into_response();
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        return resp;
+    }
+
+    (StatusCode::NOT_FOUND, "dashboard not built").into_response()
+}
+
 pub fn build_router(state: AppState) -> Router {
     let max_body = state.config.max_body_bytes;
 
@@ -84,11 +123,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/challenge", get(auth::get_challenge))
         .route("/v1/auth/register", post(auth::register))
         .route("/v1/telemetry/intervals", post(telemetry::ingest_intervals))
+        .route("/v1/estimates", get(estimates::list_partitions))
         .route("/v1/estimates/{provider}/{tier}", get(estimates::get_estimates))
+        .route(
+            "/v1/estimates/{provider}/{tier}/history",
+            get(estimates::get_estimates_history),
+        )
         .route(
             "/v1/estimates/{provider}/{tier}/predict",
             post(estimates::predict_quota),
         )
+        .fallback(serve_dashboard)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit_middleware,
