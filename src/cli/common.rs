@@ -111,15 +111,23 @@ pub fn load_state(path: &Path) -> Option<CliToolState> {
     serde_json::from_str(&data).ok()
 }
 
-pub fn save_state(path: &Path, state: &CliToolState) -> anyhow::Result<()> {
+fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    let data = serde_json::to_string_pretty(state)?;
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(tmp, path)?;
+    let data = serde_json::to_string_pretty(value)?;
+    std::fs::write(&tmp, &data)?;
+    if std::fs::rename(&tmp, path).is_err() {
+        // Windows antivirus/indexers can briefly lock the target; fallback to direct write
+        std::fs::write(path, &data)?;
+        let _ = std::fs::remove_file(&tmp);
+    }
     Ok(())
+}
+
+pub fn save_state(path: &Path, state: &CliToolState) -> anyhow::Result<()> {
+    atomic_write_json(path, state)
 }
 
 pub fn load_shared_auth(fallback_state: Option<&CliToolState>) -> Option<SavedAuth> {
@@ -143,14 +151,7 @@ pub fn load_shared_auth(fallback_state: Option<&CliToolState>) -> Option<SavedAu
 }
 
 pub fn save_shared_auth(auth: &SavedAuth) -> anyhow::Result<()> {
-    let path = shared_auth_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(auth)?)?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
+    atomic_write_json(&shared_auth_path(), auth)
 }
 
 pub fn clear_shared_auth() {

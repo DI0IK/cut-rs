@@ -47,37 +47,43 @@ All state and estimation are partitioned independently by `(provider, tier, wind
 
 ## Client & Desktop Integrations (ToS-Compliant)
 
-All client adapters use **only official, local interfaces** (no cookie extraction, no token spoofing, no private API scraping). By default, all client subcommands target `https://cut-rs.dominikstahl.dev` (override with `--server <URL>` or `CUT_RS_SERVER`) and share a single client registration in `~/.local/state/cut-rs/auth.json`.
+All client adapters use **only official, local interfaces** (no cookie extraction, no token spoofing, no private API scraping). By default, all client subcommands target `https://cut-rs.dominikstahl.dev` (override with `--server <URL>` or `CUT_RS_SERVER`) and share a single client registration:
+- **Linux:** `~/.local/state/cut-rs/auth.json`
+- **macOS:** `~/Library/Application Support/cut-rs/auth.json`
+- **Windows:** `%LOCALAPPDATA%\cut-rs\auth.json`
+
+### Install Prebuilt Binary (Linux / macOS / Windows)
+Download the latest release archive for your platform (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, or `x86_64-pc-windows-msvc`) from [GitHub Releases](https://github.com/DI0IK/cut-rs/releases), extract `cut-rs` (or `cut-rs.exe`), and place it on your `PATH`.
 
 ### 1. Antigravity CLI (`cut-rs agy-cli`)
-Add to `~/.gemini/antigravity-cli/settings.json`:
+Add to `~/.gemini/antigravity-cli/settings.json` (Windows: `%USERPROFILE%\.gemini\antigravity-cli\settings.json`):
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "/path/to/cut-rs agy-cli --print-status",
+    "command": "cut-rs agy-cli",
     "stack_with_default": true
   }
 }
 ```
 
 ### 2. Claude Code CLI & IDE Extension (`cut-rs claude-cli`)
-Works with **Claude Code CLI** and **Claude Code IDE extensions** (VS Code / JetBrains / Claude Desktop Code tab) via `~/.claude/settings.json`:
+Works with **Claude Code CLI** and **Claude Code IDE extensions** (VS Code / JetBrains / Claude Desktop Code tab) via `~/.claude/settings.json` (Windows: `%USERPROFILE%\.claude\settings.json`):
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "/path/to/cut-rs claude-cli --tier pro"
+    "command": "cut-rs claude-cli --tier pro"
   }
 }
 ```
 *(Set `--tier` or `CUT_RS_TIER` to `pro`, `max_5x`, `max_20x`, etc.)*
 
 ### 3. OpenAI Codex CLI, Desktop App, & VS Code Extension (`cut-rs codex-cli`)
-Reads local session rollout logs (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`) shared by **Codex CLI**, **Codex Desktop**, and the **Codex VS Code extension**:
+Reads local session rollout logs (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, Windows: `%USERPROFILE%\.codex\sessions\...`) shared by **Codex CLI**, **Codex Desktop**, and the **Codex VS Code extension**:
 - **Codex `notify` hook** (`~/.codex/config.toml`):
   ```toml
-  notify = ["/path/to/cut-rs", "codex-cli"]
+  notify = ["cut-rs", "codex-cli"]
   ```
 - **Continuous watcher** (e.g. for Codex Desktop / VS Code):
   ```bash
@@ -109,6 +115,9 @@ devenv shell -- bash -c "cd web && npm install && npm run build"
 devenv shell -- cargo build --release
 devenv shell -- cargo test
 devenv shell -- cargo clippy --all-targets -- -D warnings
+
+# Run the HTTP server
+./target/release/cut-rs serve
 ```
 
 ### NixOS Flake Deployment

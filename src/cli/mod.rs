@@ -10,12 +10,13 @@ use clap::{Parser, Subcommand};
 #[command(name = "cut-rs", about = "Crowdsourced AI quota telemetry server & CLI")]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Option<Commands>,
+    pub command: Commands,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Run the HTTP telemetry ingestion and estimation server (default)
+    /// Run the HTTP telemetry ingestion and estimation server
+    #[command(alias = "server")]
     Serve,
     /// Process Antigravity CLI statusLine JSON from stdin and log quota telemetry
     AgyCli(agy::AgyCliArgs),

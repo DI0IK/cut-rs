@@ -11,7 +11,8 @@ use tempfile::TempDir;
 async fn test_end_to_end_auth_ingest_estimate_predict_and_bucket_migration() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("test.db");
-    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let db_path_str = db_path.to_string_lossy().replace('\\', "/");
+    let db_url = format!("sqlite://{db_path_str}?mode=rwc");
 
     let config = Config::test_default(db_url);
     let state = init_app_state(config).await.unwrap();

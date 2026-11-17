@@ -15,23 +15,23 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::AgyCli(args)) => {
+        Commands::AgyCli(args) => {
             run_agy_cli(args).await;
             return Ok(());
         }
-        Some(Commands::ClaudeCli(args)) => {
+        Commands::ClaudeCli(args) => {
             run_claude_cli(args).await;
             return Ok(());
         }
-        Some(Commands::CodexCli(args)) => {
+        Commands::CodexCli(args) => {
             run_codex_cli(args).await;
             return Ok(());
         }
-        Some(Commands::Waybar(args)) => {
+        Commands::Waybar(args) => {
             run_waybar(args).await;
             return Ok(());
         }
-        Some(Commands::Serve) | None => {}
+        Commands::Serve => {}
     }
 
     tracing_subscriber::fmt()
