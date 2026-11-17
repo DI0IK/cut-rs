@@ -131,6 +131,112 @@ pub fn fit_irls_nnls(
     let mut weights = enforce_client_cap(&init_weights, intervals, CLIENT_CAP_FRAC);
     let mut w_vec = DVector::zeros(p);
 
+    // 3b. High-breakdown LTS (Least Trimmed Squares) seed when n >= 12:
+    // Prevents a 20-35% cluster of positive unlogged-usage spikes from pulling
+    // iteration-0 OLS into a bad local basin and inflating MAD.
+    if n >= 12 && p <= 12 {
+        let h = ((n as f64) * 0.60).ceil() as usize;
+        let h = h.max(p + 1).min(n);
+
+        let solve_subset = |subset_weights: &[f64]| -> DVector<f64> {
+            let mut a_iso = DMatrix::zeros(n, p);
+            let mut b = DVector::zeros(n);
+            for i in 0..n {
+                let sw = subset_weights[i].sqrt();
+                b[i] = y[i] * sw;
+                for m_idx in 0..m_count {
+                    let base = m_idx * 3;
+                    let t_in = x[(i, base)];
+                    let t_out = x[(i, base + 1)];
+                    let t_cache = x[(i, base + 2)];
+                    a_iso[(i, base)] = (t_in + t_out + t_cache) * sw;
+                    a_iso[(i, base + 1)] = (t_in + t_out) * sw;
+                    a_iso[(i, base + 2)] = t_out * sw;
+                }
+            }
+            let delta = solve_nnls(&a_iso, &b);
+            let mut w = DVector::zeros(p);
+            for m_idx in 0..m_count {
+                let base = m_idx * 3;
+                let d_cache = delta[base];
+                let d_in_step = delta[base + 1];
+                let d_out_step = delta[base + 2];
+                w[base] = d_cache + d_in_step;
+                w[base + 1] = d_cache + d_in_step + d_out_step;
+                w[base + 2] = d_cache;
+            }
+            w
+        };
+
+        let eval_rel_sq = |w: &DVector<f64>| -> Vec<(usize, f64)> {
+            let preds = &x * w;
+            (0..n)
+                .map(|i| {
+                    let scale = preds[i].abs().max(intervals[i].quota_precision).max(1e-4);
+                    let r = (y[i] - preds[i]) / scale;
+                    (i, r * r)
+                })
+                .collect()
+        };
+
+        // Generate deterministic candidate seeds:
+        // 1) full init_weights, 2) lower-y/token halves, 3) strided windows of size h
+        let mut seeds: Vec<Vec<f64>> = Vec::new();
+        seeds.push(weights.clone());
+
+        let mut by_rate: Vec<(usize, f64)> = (0..n)
+            .map(|i| {
+                let tok_sum: f64 = (0..p).map(|j| x[(i, j)]).sum::<f64>().max(1e-6);
+                (i, y[i] / tok_sum)
+            })
+            .collect();
+        by_rate.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut lower_half = vec![1e-8_f64; n];
+        for &(idx, _) in by_rate.iter().take(h) {
+            lower_half[idx] = weights[idx];
+        }
+        seeds.push(lower_half);
+
+        let num_strides = 6.min(n);
+        for s in 0..num_strides {
+            let mut stride_w = vec![1e-8_f64; n];
+            let mut count = 0usize;
+            for k in 0..n {
+                let idx = (s + k * num_strides) % n;
+                if count < h {
+                    stride_w[idx] = weights[idx];
+                    count += 1;
+                }
+            }
+            seeds.push(stride_w);
+        }
+
+        let mut best_obj = f64::INFINITY;
+        let mut best_weights = weights.clone();
+        for seed in seeds {
+            let mut cur_w = seed;
+            let mut cur_vec = solve_subset(&cur_w);
+            for _c_step in 0..3 {
+                let mut errs = eval_rel_sq(&cur_vec);
+                errs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                let mut next_w = vec![1e-8_f64; n];
+                for &(idx, _) in errs.iter().take(h) {
+                    next_w[idx] = init_weights[idx];
+                }
+                cur_w = enforce_client_cap(&next_w, intervals, CLIENT_CAP_FRAC);
+                cur_vec = solve_subset(&cur_w);
+            }
+            let mut final_errs = eval_rel_sq(&cur_vec);
+            final_errs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let trimmed_sum: f64 = final_errs.iter().take(h).map(|x| x.1).sum();
+            if trimmed_sum < best_obj {
+                best_obj = trimmed_sum;
+                best_weights = cur_w;
+            }
+        }
+        weights = best_weights;
+    }
+
     // 4. IRLS loop wrapping monotonic Active-Set NNLS (w_out >= w_in >= w_cached >= 0 per model)
     let num_models = active_models.len();
     for _iter in 0..MAX_IRLS_ITERS {
@@ -728,5 +834,77 @@ mod tests {
         assert!((mix.in_share + mix.out_share + mix.cached_share - 1.0).abs() < 1e-6);
         assert!(m.pct_per_1m_in_ci.upper.is_finite() && m.pct_per_1m_in_ci.upper < 100.0);
         assert!(m.pct_per_1m_out_ci.upper.is_finite() && m.pct_per_1m_out_ci.upper < 100.0);
+    }
+
+    #[test]
+    fn test_irls_lts_seed_resists_30pct_positive_spikes() {
+        let now = 1_700_000_000;
+        let mut clients = HashMap::new();
+        for c in 0..5 {
+            clients.insert(
+                format!("c{c}"),
+                ClientRecord {
+                    client_id: format!("c{c}"),
+                    subnet_hash: format!("s{c}"),
+                    trust_tier: TrustTier::Trusted,
+                    trust_score: 1.0,
+                    ema_abs_z: 0.0,
+                    accepted_count: 20,
+                    created_at: now - 86_400,
+                    last_seen_at: now,
+                },
+            );
+        }
+
+        let mut intervals = Vec::new();
+        for i in 0..20 {
+            let t_in = 3_000 + (i as u64 * 2_500);
+            let t_out = 500 + ((i % 4) as u64 * 1_200);
+            let t_cache = 100_000 + ((i % 5) as u64 * 200_000);
+            let base_pct =
+                (t_in as f64 * 5.0 + t_out as f64 * 25.0 + t_cache as f64 * 0.25) / 1_000_000.0;
+            // 30% of intervals (6/20) have +0.50% or +1.00% extra unlogged spikes
+            let spike = if i % 3 == 0 && i < 18 {
+                if i % 2 == 0 { 1.0 } else { 0.5 }
+            } else {
+                0.0
+            };
+            intervals.push(IntervalRecord {
+                id: i as i64 + 1,
+                idempotency_key: format!("lts-{i}"),
+                client_id: format!("c{}", i % 5),
+                provider: "antigravity".to_string(),
+                tier: "pro".to_string(),
+                window_type: "gemini-5h".to_string(),
+                started_at: now - 1000 + i * 20,
+                ended_at: now - 990 + i * 20,
+                delta_pct: base_pct + spike,
+                quota_precision: 0.0001,
+                usage: vec![UsageEntry {
+                    model: "gemini-4".to_string(),
+                    tokens_in: t_in,
+                    tokens_out: t_out,
+                    tokens_cached_in: t_cache,
+                    request_count: 1,
+                }],
+                residual_pct: None,
+                weight_assigned: None,
+                ingested_at: now - 990 + i * 20,
+            });
+        }
+
+        let res = fit_irls_nnls(&intervals, &clients, now, 14).unwrap();
+        let m = &res.models[0];
+        assert!((m.pct_per_1m_in - 5.0).abs() < 0.1, "in={}", m.pct_per_1m_in);
+        assert!(
+            (m.pct_per_1m_out - 25.0).abs() < 0.2,
+            "out={}",
+            m.pct_per_1m_out
+        );
+        assert!(
+            (m.pct_per_1m_cached_in - 0.25).abs() < 0.01,
+            "cached={}",
+            m.pct_per_1m_cached_in
+        );
     }
 }
