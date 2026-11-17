@@ -1,3 +1,4 @@
+use crate::api::HistoryCache;
 use crate::config::Config;
 use crate::db::TelemetryRepository;
 use crate::math::changepoint::{W_LONG, evaluate_changepoint};
@@ -17,19 +18,30 @@ pub type SnapshotCache = Arc<DashMap<PartitionKey, SnapshotPayload>>;
 pub fn spawn_worker(
     repo: Arc<dyn TelemetryRepository>,
     cache: SnapshotCache,
+    history_cache: HistoryCache,
     config: Arc<Config>,
     notify: Arc<Notify>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(config.worker_interval_secs));
+        let mut first_pass = true;
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = notify.notified() => {}
             }
-            if let Err(err) = process_all_partitions(repo.as_ref(), &cache, &config).await {
+            if let Err(err) = process_all_partitions_inner(
+                repo.as_ref(),
+                &cache,
+                Some(&history_cache),
+                &config,
+                first_pass,
+            )
+            .await
+            {
                 tracing::error!(error = ?err, "background estimation worker pass failed");
             }
+            first_pass = false;
         }
     });
 }
@@ -39,18 +51,35 @@ pub async fn process_all_partitions(
     cache: &SnapshotCache,
     config: &Config,
 ) -> Result<(), crate::error::AppError> {
+    process_all_partitions_inner(repo, cache, None, config, false).await
+}
+
+async fn process_all_partitions_inner(
+    repo: &dyn TelemetryRepository,
+    cache: &SnapshotCache,
+    history_cache: Option<&HistoryCache>,
+    config: &Config,
+    force_recompute: bool,
+) -> Result<(), crate::error::AppError> {
     let partitions = repo.list_active_partitions().await?;
     let now = Utc::now().timestamp();
 
     for key in partitions {
-        if let Err(err) = process_partition(repo, cache, config, &key, now).await {
-            tracing::warn!(
-                provider = %key.provider,
-                tier = %key.tier,
-                window_type = %key.window_type,
-                error = ?err,
-                "failed processing partition"
-            );
+        match process_partition_inner(repo, cache, config, &key, now, force_recompute).await {
+            Ok(updated) => {
+                if updated && let Some(hc) = history_cache {
+                    hc.retain(|(p, _, _), _| p != &key.provider);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    provider = %key.provider,
+                    tier = %key.tier,
+                    window_type = %key.window_type,
+                    error = ?err,
+                    "failed processing partition"
+                );
+            }
         }
     }
     Ok(())
@@ -63,6 +92,18 @@ pub async fn process_partition(
     key: &PartitionKey,
     now: i64,
 ) -> Result<(), crate::error::AppError> {
+    let _ = process_partition_inner(repo, cache, config, key, now, false).await?;
+    Ok(())
+}
+
+async fn process_partition_inner(
+    repo: &dyn TelemetryRepository,
+    cache: &SnapshotCache,
+    config: &Config,
+    key: &PartitionKey,
+    now: i64,
+    force_recompute: bool,
+) -> Result<bool, crate::error::AppError> {
     let prev_snap = cache.get(key).map(|r| r.value().clone());
     let mut regime_since = prev_snap.as_ref().map(|s| s.regime_since).unwrap_or(0);
     let prev_cusum_pos = prev_snap.as_ref().map(|s| s.cusum_pos).unwrap_or(0.0);
@@ -96,9 +137,10 @@ pub async fn process_partition(
                 }
                 repo.save_snapshot(&snap).await?;
                 cache.insert(key.clone(), snap);
+                return Ok(true);
             }
         }
-        return Ok(());
+        return Ok(false);
     }
 
     let last_ingested = intervals.iter().map(|iv| iv.ingested_at).max().unwrap_or(now);
@@ -112,12 +154,13 @@ pub async fn process_partition(
     });
 
     if let Some(prev) = &prev_snap
+        && !force_recompute
         && !has_unfitted
         && prev.sample_count_window == intervals.len()
         && prev.stale == stale
         && !has_newly_retired_model
     {
-        return Ok(());
+        return Ok(false);
     }
 
     let client_ids: Vec<String> = intervals
@@ -129,7 +172,7 @@ pub async fn process_partition(
     let clients = repo.get_clients_by_ids(&client_ids).await?;
 
     let Some(fit) = fit_irls_nnls(&intervals, &clients, now, config.model_stale_days) else {
-        return Ok(());
+        return Ok(false);
     };
 
     let cp = evaluate_changepoint(
@@ -288,5 +331,5 @@ pub async fn process_partition(
 
     repo.save_snapshot(&snap).await?;
     cache.insert(key.clone(), snap);
-    Ok(())
+    Ok(true)
 }

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CostMetric, TimelineChart } from "./components/TimelineChart";
-import { ModelTable } from "./components/ModelTable";
+import { ModelTable, ModelTableRow } from "./components/ModelTable";
 import { Predictor } from "./components/Predictor";
+import { HoverCard } from "./components/HoverCard";
 import {
   ChangeEvent,
   HistorySnapshotPoint,
@@ -134,13 +135,14 @@ export function App() {
     return () => clearInterval(id);
   }, [refreshData]);
 
-  const modelRows = useMemo(
+  const modelRows: ModelTableRow[] = useMemo(
     () =>
       windowsByTier.flatMap(({ tier: t, view }) =>
         view.models.map((m) => ({
           tier: t,
           windowType: view.window_type,
           mix: view.token_mix,
+          sigmaHat: view.sigma_hat,
           model: m,
         }))
       ),
@@ -300,21 +302,51 @@ export function App() {
 
       <section className="kpi-strip">
         <div className="kpi">
-          <div className="kpi-label">Window Samples</div>
+          <HoverCard
+            card={
+              <div className="hc-grid">
+                <div className="hc-title">Window Samples</div>
+                <div className="hc-desc">
+                  Total quota-drop intervals in the current active regime across the selected
+                  buckets.
+                </div>
+              </div>
+            }
+          >
+            <div className="kpi-label hc-trigger">Window Samples</div>
+          </HoverCard>
           <div className="kpi-val">{totalSamples}</div>
         </div>
-        <div
-          className="kpi"
-          title="Effective independent contributors after the 5% per-client weight cap"
-        >
-          <div className="kpi-label">Eff. Contributors</div>
+        <div className="kpi">
+          <HoverCard
+            card={
+              <div className="hc-grid">
+                <div className="hc-title">Effective Contributors</div>
+                <div className="hc-desc">
+                  Effective independent clients after the 5% per-client weight cap (anti-Sybil
+                  protection).
+                </div>
+              </div>
+            }
+          >
+            <div className="kpi-label hc-trigger">Eff. Contributors</div>
+          </HoverCard>
           <div className="kpi-val">{maxContributors.toFixed(1)}</div>
         </div>
-        <div
-          className="kpi"
-          title="Empirical share of input, output, and cached tokens across recent samples"
-        >
-          <div className="kpi-label">Crowdsourced Token Mix</div>
+        <div className="kpi">
+          <HoverCard
+            card={
+              <div className="hc-grid">
+                <div className="hc-title">Crowdsourced Token Mix</div>
+                <div className="hc-desc">
+                  Empirical share of uncached input, output, and cached input tokens used to
+                  compute the Blended cost rate.
+                </div>
+              </div>
+            }
+          >
+            <div className="kpi-label hc-trigger">Crowdsourced Token Mix</div>
+          </HoverCard>
           <div className="kpi-val" style={{ fontSize: 13 }}>
             {(avgMix.in_share * 100).toFixed(0)}% in ·{" "}
             {(avgMix.out_share * 100).toFixed(0)}% out ·{" "}

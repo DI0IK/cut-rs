@@ -84,7 +84,7 @@ pub struct HistoryQuery {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HistoryModelPoint {
     pub model: String,
     pub pct_per_1m_in: f64,
@@ -92,7 +92,7 @@ pub struct HistoryModelPoint {
     pub pct_per_1m_cached_in: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HistorySnapshotPoint {
     pub tier: String,
     pub window_type: String,
@@ -119,44 +119,159 @@ pub async fn get_estimates_history(
 ) -> Result<Json<HistoryResponse>, AppError> {
     let provider_norm = normalize_key(&provider);
     let tier_norm = normalize_key(&tier);
+    let wt_norm = query
+        .window_type
+        .as_deref()
+        .map(normalize_key)
+        .unwrap_or_else(|| "all".to_string());
+    let limit = query.limit.unwrap_or(180).clamp(1, 500);
+
+    let cache_key = (provider_norm.clone(), tier_norm.clone(), wt_norm.clone());
+    if let Some(cached) = state.history_cache.get(&cache_key) {
+        let mut points = cached.value().clone();
+        if points.len() > limit {
+            points.truncate(limit);
+        }
+        return Ok(Json(HistoryResponse {
+            provider: provider_norm,
+            tier: tier_norm,
+            points,
+        }));
+    }
+
     let tier_filter = if tier_norm == "all" || tier_norm == "*" {
         None
     } else {
         Some(tier_norm.as_str())
     };
-    let wt_norm = query.window_type.as_deref().map(normalize_key);
-    let wt_filter = wt_norm.as_deref().filter(|w| *w != "all" && *w != "*");
-    let limit = query.limit.unwrap_or(180).clamp(1, 500);
+    let wt_filter = if wt_norm == "all" || wt_norm == "*" {
+        None
+    } else {
+        Some(wt_norm.as_str())
+    };
 
-    let snaps = state
-        .repo
-        .load_snapshot_history(&provider_norm, tier_filter, wt_filter, limit)
-        .await?;
-
-    let points = snaps
-        .into_iter()
-        .map(|s| HistorySnapshotPoint {
-            tier: s.tier,
-            window_type: s.window_type,
-            computed_at: s.computed_at,
-            regime_since: s.regime_since,
-            sample_count_window: s.sample_count_window,
-            effective_contributors: s.effective_contributors,
-            token_mix: s.token_mix,
-            models: s
-                .models
-                .into_iter()
-                .filter(|m| m.status == ModelStatus::Active)
-                .map(|m| HistoryModelPoint {
-                    model: m.model,
-                    pct_per_1m_in: m.pct_per_1m_in,
-                    pct_per_1m_out: m.pct_per_1m_out,
-                    pct_per_1m_cached_in: m.pct_per_1m_cached_in,
-                })
-                .collect(),
-            recent_change_events: s.recent_change_events,
+    let matching_keys: Vec<_> = state
+        .cache
+        .iter()
+        .filter(|e| {
+            let k = e.key();
+            k.provider == provider_norm
+                && tier_filter.is_none_or(|t| k.tier == t)
+                && wt_filter.is_none_or(|w| k.window_type == w)
         })
+        .map(|e| (e.key().clone(), e.value().clone()))
         .collect();
+
+    let mut points = Vec::new();
+    for (key, snap) in matching_keys {
+        let mut intervals = state
+            .repo
+            .fetch_window_intervals(&key, snap.regime_since, crate::math::changepoint::W_LONG)
+            .await?;
+        if intervals.is_empty() {
+            continue;
+        }
+        // Chronological order
+        intervals.sort_by_key(|iv| (iv.ended_at, iv.id));
+        let client_ids: Vec<String> = intervals
+            .iter()
+            .map(|iv| iv.client_id.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let clients = state.repo.get_clients_by_ids(&client_ids).await?;
+
+        let n = intervals.len();
+        let max_checkpoints = 40usize;
+        let indices: Vec<usize> = if n <= max_checkpoints {
+            (1..=n).collect()
+        } else {
+            (0..max_checkpoints)
+                .map(|i| 1 + (i * (n - 1)) / (max_checkpoints - 1))
+                .collect()
+        };
+
+        let last_idx = indices.len().saturating_sub(1);
+        for (ci, &end_count) in indices.iter().enumerate() {
+            let slice = &intervals[..end_count];
+            let ts = slice.last().map(|iv| iv.ended_at).unwrap_or(snap.computed_at);
+            let Some(fit) = crate::math::irls::fit_irls_nnls(
+                slice,
+                &clients,
+                ts,
+                state.config.model_stale_days,
+            ) else {
+                continue;
+            };
+            if fit.models.is_empty() {
+                continue;
+            }
+            points.push(HistorySnapshotPoint {
+                tier: key.tier.clone(),
+                window_type: key.window_type.clone(),
+                computed_at: ts,
+                regime_since: snap.regime_since,
+                sample_count_window: slice.len(),
+                effective_contributors: fit.effective_contributors,
+                token_mix: fit.token_mix,
+                models: fit
+                    .models
+                    .into_iter()
+                    .filter(|m| m.status == ModelStatus::Active)
+                    .map(|m| HistoryModelPoint {
+                        model: m.model,
+                        pct_per_1m_in: m.pct_per_1m_in,
+                        pct_per_1m_out: m.pct_per_1m_out,
+                        pct_per_1m_cached_in: m.pct_per_1m_cached_in,
+                    })
+                    .collect(),
+                recent_change_events: if ci == last_idx {
+                    snap.recent_change_events.clone()
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+    }
+
+    // Fallback to persisted snapshots if no intervals were found
+    if points.is_empty() {
+        let snaps = state
+            .repo
+            .load_snapshot_history(&provider_norm, tier_filter, wt_filter, limit)
+            .await?;
+        points = snaps
+            .into_iter()
+            .map(|s| HistorySnapshotPoint {
+                tier: s.tier,
+                window_type: s.window_type,
+                computed_at: s.computed_at,
+                regime_since: s.regime_since,
+                sample_count_window: s.sample_count_window,
+                effective_contributors: s.effective_contributors,
+                token_mix: s.token_mix,
+                models: s
+                    .models
+                    .into_iter()
+                    .filter(|m| m.status == ModelStatus::Active)
+                    .map(|m| HistoryModelPoint {
+                        model: m.model,
+                        pct_per_1m_in: m.pct_per_1m_in,
+                        pct_per_1m_out: m.pct_per_1m_out,
+                        pct_per_1m_cached_in: m.pct_per_1m_cached_in,
+                    })
+                    .collect(),
+                recent_change_events: s.recent_change_events,
+            })
+            .collect();
+    } else {
+        points.sort_by_key(|p| p.computed_at);
+    }
+
+    state.history_cache.insert(cache_key, points.clone());
+    if points.len() > limit {
+        points.truncate(limit);
+    }
 
     Ok(Json(HistoryResponse {
         provider: provider_norm,

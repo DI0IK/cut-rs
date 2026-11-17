@@ -32,6 +32,7 @@ pub async fn init_app_state(config: Config) -> Result<AppState, error::AppError>
     Ok(AppState {
         repo,
         cache,
+        history_cache: Arc::new(DashMap::new()),
         config: Arc::new(config),
         rate_tracker: Arc::new(RegistrationRateTracker::new()),
         worker_notify: Arc::new(Notify::new()),

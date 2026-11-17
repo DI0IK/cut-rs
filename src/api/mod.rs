@@ -2,6 +2,7 @@ pub mod auth;
 pub mod estimates;
 pub mod telemetry;
 
+use crate::api::estimates::HistorySnapshotPoint;
 use crate::auth::{RegistrationRateTracker, extract_client_ip};
 use crate::config::Config;
 use crate::db::TelemetryRepository;
@@ -29,10 +30,13 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+pub type HistoryCache = Arc<DashMap<(String, String, String), Vec<HistorySnapshotPoint>>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub repo: Arc<dyn TelemetryRepository>,
     pub cache: SnapshotCache,
+    pub history_cache: HistoryCache,
     pub config: Arc<Config>,
     pub rate_tracker: Arc<RegistrationRateTracker>,
     pub worker_notify: Arc<Notify>,

@@ -76,6 +76,9 @@ pub struct CliToolState {
     /// Discovered subagent transcript paths for the active session
     #[serde(default)]
     pub active_subagent_transcripts: Vec<String>,
+    /// Mapping from conversation/session ID to last observed model ID (for concurrent tabs)
+    #[serde(default)]
+    pub session_models: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +86,15 @@ pub struct QuotaSample {
     pub bucket_id: String,
     pub remaining_fraction: f64,
     pub reset_time: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelDelta {
+    pub model: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub tokens_cached_in: u64,
+    pub request_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +111,8 @@ pub struct TickInput {
     pub total_cached_tokens: Option<u64>,
     /// Optional precomputed per-tick deltas (in, out, cached_in, request_count) from transcript tailing
     pub precomputed_delta: Option<(u64, u64, u64, u64)>,
+    /// Optional per-model deltas when aggregating across multiple concurrent chat logs
+    pub multi_deltas: Option<Vec<ModelDelta>>,
     /// When true, reset pending bucket usage and skip emitting an interval (e.g. unattributed subagent)
     pub skip_emit: bool,
     pub quotas: Vec<QuotaSample>,
@@ -142,6 +156,26 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()>
 
 pub fn save_state(path: &Path, state: &CliToolState) -> anyhow::Result<()> {
     atomic_write_json(path, state)
+}
+
+/// Acquires an exclusive advisory OS lock on `<state_path>.lock` so concurrent CLI
+/// invocations never race on `file_offsets`, `pending_usage`, or `pending_intervals`.
+pub fn acquire_state_lock(state_path: &Path) -> Option<std::fs::File> {
+    if let Some(parent) = state_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut os = state_path.as_os_str().to_os_string();
+    os.push(".lock");
+    let lock_path = PathBuf::from(os);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+    let _ = file.lock();
+    Some(file)
 }
 
 pub fn load_shared_auth(fallback_state: Option<&CliToolState>) -> Option<SavedAuth> {
@@ -271,6 +305,7 @@ where
         .state_file
         .clone()
         .unwrap_or_else(|| default_state_file_path(default_state_filename));
+    let _lock = acquire_state_lock(&state_path);
     let mut state = load_state(&state_path).unwrap_or_default();
 
     let now = Utc::now().timestamp();
@@ -308,7 +343,14 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
     let counters_reset = tick.total_input_tokens < state.last_total_input_tokens
         || tick.total_output_tokens < state.last_total_output_tokens;
 
-    let (delta_in, delta_out, delta_cached, delta_reqs) = if let Some(d) = tick.precomputed_delta {
+    let (delta_in, delta_out, delta_cached, delta_reqs) = if tick.multi_deltas.is_some() {
+        if session_changed {
+            state.session_id = Some(tick.session_id.clone());
+        }
+        state.last_total_input_tokens = tick.total_input_tokens;
+        state.last_total_output_tokens = tick.total_output_tokens;
+        (0, 0, 0, 0)
+    } else if let Some(d) = tick.precomputed_delta {
         if session_changed {
             state.session_id = Some(tick.session_id.clone());
             state.active_subagent_transcripts.clear();
@@ -340,6 +382,33 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
         for tracker in state.buckets.values_mut() {
             tracker.pending_usage.clear();
             tracker.started_at = tick.timestamp;
+        }
+    } else if let Some(multi) = &tick.multi_deltas {
+        for d in multi {
+            let model_name = normalize_key(&d.model);
+            if !model_name.is_empty()
+                && (d.tokens_in > 0 || d.tokens_out > 0 || d.tokens_cached_in > 0)
+            {
+                for tracker in state.buckets.values_mut() {
+                    let entry = tracker
+                        .pending_usage
+                        .entry(model_name.clone())
+                        .or_insert_with(|| UsageEntry {
+                            model: model_name.clone(),
+                            tokens_in: 0,
+                            tokens_out: 0,
+                            tokens_cached_in: 0,
+                            request_count: 0,
+                        });
+                    entry.tokens_in = entry.tokens_in.saturating_add(d.tokens_in);
+                    entry.tokens_out = entry.tokens_out.saturating_add(d.tokens_out);
+                    entry.tokens_cached_in =
+                        entry.tokens_cached_in.saturating_add(d.tokens_cached_in);
+                    entry.request_count = entry
+                        .request_count
+                        .saturating_add(d.request_count.max(1).min(u32::MAX as u64) as u32);
+                }
+            }
         }
     } else if let Some(model_raw) = &tick.model {
         let model_name = normalize_key(model_raw);

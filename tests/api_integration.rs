@@ -75,7 +75,7 @@ async fn test_end_to_end_auth_ingest_estimate_predict_and_bucket_migration() {
     for i in 0..15 {
         let t_in = 100_000 + i * 25_000;
         let t_out = 10_000 + i * 5_000;
-        let t_cache = 40_000 + i * 10_000;
+        let t_cache = 40_000 + ((i * 7) % 11) * 15_000;
         let delta = 2.0 * (t_in as f64 / 1e6)
             + 10.0 * (t_out as f64 / 1e6)
             + 0.2 * (t_cache as f64 / 1e6);
@@ -233,7 +233,9 @@ async fn test_end_to_end_auth_ingest_estimate_predict_and_bucket_migration() {
         .json()
         .await
         .unwrap();
-    assert_eq!(hist["points"].as_array().unwrap().len(), 2);
+    let hist_points = hist["points"].as_array().unwrap();
+    assert_eq!(hist_points.len(), 21);
+    assert!(!hist_points.last().unwrap()["models"].as_array().unwrap().is_empty());
 
     let html_resp = client.get(format!("{base}/")).send().await.unwrap();
     assert_eq!(html_resp.status(), 200);

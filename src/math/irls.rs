@@ -119,19 +119,36 @@ pub fn fit_irls_nnls(
     let mut weights = enforce_client_cap(&init_weights, intervals, CLIENT_CAP_FRAC);
     let mut w_vec = DVector::zeros(p);
 
-    // 4. IRLS loop wrapping Active-Set NNLS
+    // 4. IRLS loop wrapping monotonic Active-Set NNLS (w_out >= w_in >= w_cached >= 0 per model)
+    let num_models = active_models.len();
     for _iter in 0..MAX_IRLS_ITERS {
-        let mut a = DMatrix::zeros(n, p);
+        let mut a_iso = DMatrix::zeros(n, p);
         let mut b = DVector::zeros(n);
         for i in 0..n {
             let sw = weights[i].sqrt();
             b[i] = y[i] * sw;
-            for j in 0..p {
-                a[(i, j)] = x[(i, j)] * sw;
+            for m_idx in 0..num_models {
+                let base = m_idx * 3;
+                let t_in = x[(i, base)];
+                let t_out = x[(i, base + 1)];
+                let t_cache = x[(i, base + 2)];
+                a_iso[(i, base)] = (t_in + t_out + t_cache) * sw;
+                a_iso[(i, base + 1)] = (t_in + t_out) * sw;
+                a_iso[(i, base + 2)] = t_out * sw;
             }
         }
 
-        let next_w = solve_nnls(&a, &b);
+        let delta = solve_nnls(&a_iso, &b);
+        let mut next_w = DVector::zeros(p);
+        for m_idx in 0..num_models {
+            let base = m_idx * 3;
+            let d_cache = delta[base];
+            let d_in_step = delta[base + 1];
+            let d_out_step = delta[base + 2];
+            next_w[base] = d_cache + d_in_step;
+            next_w[base + 1] = d_cache + d_in_step + d_out_step;
+            next_w[base + 2] = d_cache;
+        }
         let diff = (&next_w - &w_vec).norm() / next_w.norm().max(1.0);
         w_vec = next_w;
 
@@ -571,5 +588,65 @@ mod tests {
         for (_, cw) in by_client {
             assert!(cw <= 0.0501 * total_w, "client weight {cw} exceeded 5% of {total_w}");
         }
+    }
+
+    #[test]
+    fn test_irls_enforces_monotonic_weights_on_tiny_sample() {
+        let now = 1_700_000_000;
+        let mut clients = HashMap::new();
+        clients.insert("c1".to_string(), make_client("c1", 1.0));
+
+        let intervals = vec![
+            IntervalRecord {
+                id: 1,
+                idempotency_key: "m1".to_string(),
+                client_id: "c1".to_string(),
+                provider: "antigravity".to_string(),
+                tier: "pro".to_string(),
+                window_type: "gemini-5h".to_string(),
+                started_at: now - 200,
+                ended_at: now - 100,
+                delta_pct: 0.50,
+                quota_precision: 0.01,
+                usage: vec![UsageEntry {
+                    model: "gemini-4".to_string(),
+                    tokens_in: 10_000,
+                    tokens_out: 5_000,
+                    tokens_cached_in: 1_000_000,
+                    request_count: 1,
+                }],
+                residual_pct: None,
+                weight_assigned: None,
+                ingested_at: now - 100,
+            },
+            IntervalRecord {
+                id: 2,
+                idempotency_key: "m2".to_string(),
+                client_id: "c1".to_string(),
+                provider: "antigravity".to_string(),
+                tier: "pro".to_string(),
+                window_type: "gemini-5h".to_string(),
+                started_at: now - 90,
+                ended_at: now - 10,
+                delta_pct: 1.05,
+                quota_precision: 0.01,
+                usage: vec![UsageEntry {
+                    model: "gemini-4".to_string(),
+                    tokens_in: 20_000,
+                    tokens_out: 10_000,
+                    tokens_cached_in: 2_000_000,
+                    request_count: 1,
+                }],
+                residual_pct: None,
+                weight_assigned: None,
+                ingested_at: now - 10,
+            },
+        ];
+
+        let res = fit_irls_nnls(&intervals, &clients, now, 7).unwrap();
+        let m = &res.models[0];
+        assert!(m.pct_per_1m_out >= m.pct_per_1m_in);
+        assert!(m.pct_per_1m_in >= m.pct_per_1m_cached_in);
+        assert!(m.pct_per_1m_cached_in > 0.0);
     }
 }

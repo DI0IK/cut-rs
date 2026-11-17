@@ -1,7 +1,27 @@
 import { ModelWeightEstimate, TokenMix } from "../types";
+import { HoverCard } from "./HoverCard";
+
+export interface ModelTableRow {
+  tier: string;
+  windowType: string;
+  mix: TokenMix;
+  sigmaHat: number;
+  model: ModelWeightEstimate;
+}
 
 interface Props {
-  rows: { tier: string; windowType: string; mix: TokenMix; model: ModelWeightEstimate }[];
+  rows: ModelTableRow[];
+}
+
+function identifiabilityExplanation(level: ModelWeightEstimate["identifiability"]): string {
+  switch (level) {
+    case "high":
+      return "High: Input, output, and cached weights are well-separated with low collinearity.";
+    case "moderate":
+      return "Moderate: Blended cost is solid; individual weights are stabilizing as more varied turns arrive.";
+    case "low_collinear":
+      return "Low (collinear): Tokens move in a similar ratio across turns. Needs more low-cache / cold-start turns to separate In from Cached.";
+  }
 }
 
 export function ModelTable({ rows }: Props) {
@@ -10,7 +30,7 @@ export function ModelTable({ rows }: Props) {
       <div className="panel-head">
         <span className="panel-title">Active Model Weights (% per 1M tokens)</span>
         <span className="mono" style={{ fontSize: 11, color: "var(--ink-muted)" }}>
-          95% CI shown below estimate
+          Hover values for capacity &amp; diagnostics
         </span>
       </div>
       <div className="table-wrap">
@@ -30,17 +50,51 @@ export function ModelTable({ rows }: Props) {
               </tr>
             </thead>
             <tbody>
-              {rows.map(({ tier, windowType, mix, model }) => {
+              {rows.map(({ tier, windowType, mix, sigmaHat, model }) => {
                 const blended =
                   mix.in_share * model.pct_per_1m_in +
                   mix.out_share * model.pct_per_1m_out +
                   mix.cached_share * model.pct_per_1m_cached_in;
+                const impliedBlendedM = blended > 1e-6 ? 100 / blended : null;
+                const impliedOutM =
+                  model.pct_per_1m_out > 1e-6 ? 100 / model.pct_per_1m_out : null;
+
                 return (
                   <tr key={`${tier}-${windowType}-${model.model}`}>
                     <td>
-                      <strong className="mono" style={{ fontSize: 12 }}>
-                        {model.model}
-                      </strong>
+                      <HoverCard
+                        card={
+                          <div className="hc-grid">
+                            <div className="hc-title">{model.model}</div>
+                            <div className="hc-row">
+                              <span>Tier / Samples</span>
+                              <strong>
+                                {tier} · n={model.sample_count}
+                              </strong>
+                            </div>
+                            <div className="hc-row">
+                              <span>100% Window (Blended)</span>
+                              <strong>
+                                {impliedBlendedM ? `~${impliedBlendedM.toFixed(1)}M tok` : "--"}
+                              </strong>
+                            </div>
+                            <div className="hc-row">
+                              <span>100% Window (Out-only)</span>
+                              <strong>
+                                {impliedOutM ? `~${impliedOutM.toFixed(2)}M tok` : "--"}
+                              </strong>
+                            </div>
+                            <div className="hc-row">
+                              <span>Last Seen</span>
+                              <span>{new Date(model.last_seen_at * 1000).toLocaleString()}</span>
+                            </div>
+                          </div>
+                        }
+                      >
+                        <strong className="mono hc-trigger" style={{ fontSize: 12 }}>
+                          {model.model}
+                        </strong>
+                      </HoverCard>
                       <span className="ci-sub mono">
                         n={model.sample_count} · {tier}
                       </span>
@@ -49,7 +103,34 @@ export function ModelTable({ rows }: Props) {
                       {windowType}
                     </td>
                     <td className="num">
-                      <strong>{blended.toFixed(2)}%</strong>
+                      <HoverCard
+                        align="right"
+                        card={
+                          <div className="hc-grid">
+                            <div className="hc-title">Blended Mix Breakdown</div>
+                            <div className="hc-row">
+                              <span>In ({(mix.in_share * 100).toFixed(1)}%)</span>
+                              <span>{(mix.in_share * model.pct_per_1m_in).toFixed(3)}%</span>
+                            </div>
+                            <div className="hc-row">
+                              <span>Out ({(mix.out_share * 100).toFixed(1)}%)</span>
+                              <span>{(mix.out_share * model.pct_per_1m_out).toFixed(3)}%</span>
+                            </div>
+                            <div className="hc-row">
+                              <span>Cached ({(mix.cached_share * 100).toFixed(1)}%)</span>
+                              <span>
+                                {(mix.cached_share * model.pct_per_1m_cached_in).toFixed(3)}%
+                              </span>
+                            </div>
+                            <div className="hc-row">
+                              <span>Residual σ̂</span>
+                              <span>±{sigmaHat.toFixed(3)}%</span>
+                            </div>
+                          </div>
+                        }
+                      >
+                        <strong className="hc-trigger">{blended.toFixed(2)}%</strong>
+                      </HoverCard>
                     </td>
                     <td className="num">
                       {model.pct_per_1m_in.toFixed(2)}%
@@ -73,9 +154,21 @@ export function ModelTable({ rows }: Props) {
                       </span>
                     </td>
                     <td>
-                      <span className={`badge ${model.identifiability}`}>
-                        {model.identifiability}
-                      </span>
+                      <HoverCard
+                        align="right"
+                        card={
+                          <div className="hc-grid">
+                            <div className="hc-title">Collinearity Diagnostic</div>
+                            <div className="hc-desc">
+                              {identifiabilityExplanation(model.identifiability)}
+                            </div>
+                          </div>
+                        }
+                      >
+                        <span className={`badge hc-trigger ${model.identifiability}`}>
+                          {model.identifiability}
+                        </span>
+                      </HoverCard>
                     </td>
                   </tr>
                 );

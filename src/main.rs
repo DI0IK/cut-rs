@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_worker(
         state.repo.clone(),
         state.cache.clone(),
+        state.history_cache.clone(),
         state.config.clone(),
         state.worker_notify.clone(),
     );

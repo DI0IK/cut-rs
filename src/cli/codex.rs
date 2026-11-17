@@ -1,6 +1,7 @@
 use crate::cli::common::{
-    CliToolState, CommonClientArgs, QuotaSample, TickInput, apply_token_and_quota_tick,
-    default_state_file_path, epoch_to_rfc3339, flush_pending_intervals, load_state, save_state,
+    CliToolState, CommonClientArgs, QuotaSample, TickInput, acquire_state_lock,
+    apply_token_and_quota_tick, default_state_file_path, epoch_to_rfc3339, flush_pending_intervals,
+    load_state, save_state,
 };
 use chrono::{DateTime, Utc};
 use clap::Args;
@@ -91,6 +92,7 @@ async fn run_codex_once(args: &CodexCliArgs) -> anyhow::Result<()> {
         .state_file
         .clone()
         .unwrap_or_else(|| default_state_file_path("codex-cli-state.json"));
+    let _lock = acquire_state_lock(&state_path);
     let mut state = load_state(&state_path).unwrap_or_default();
 
     let emitted = scan_codex_sessions(&sessions_dir, &mut state, &args.tier);
@@ -286,6 +288,7 @@ fn process_rollout_line(
                     .unwrap_or(0),
                 total_cached_tokens: Some(totals.cached_input_tokens),
                 precomputed_delta: None,
+                multi_deltas: None,
                 skip_emit: false,
                 quotas,
                 timestamp: ts,
