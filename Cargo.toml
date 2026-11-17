@@ -1,6 +1,6 @@
 [package]
 name = "cut-rs"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 description = "Crowdsourced AI quota telemetry server, estimator, and local CLI"
 license = "MIT"

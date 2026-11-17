@@ -401,26 +401,10 @@ pub fn apply_token_and_quota_tick(state: &mut CliToolState, tick: &TickInput) ->
         (di, do_, dc, reqs)
     };
 
-    let dropping_on_tick: std::collections::HashSet<&str> = tick
-        .quotas
-        .iter()
-        .filter(|q| {
-            q.remaining_fraction.is_finite()
-                && state
-                    .buckets
-                    .get(&q.bucket_id)
-                    .is_some_and(|t| q.remaining_fraction < t.last_remaining_fraction - 1e-7)
-        })
-        .map(|q| q.bucket_id.as_str())
-        .collect();
-
     let should_accumulate_in_bucket =
         |bucket_id: &str,
          model_name: &str,
          solo_map: &HashMap<String, std::collections::HashSet<String>>| {
-            if dropping_on_tick.contains(bucket_id) {
-                return true;
-            }
             let model_has_solo_bucket = solo_map.values().any(|ms| ms.contains(model_name));
             if !model_has_solo_bucket {
                 return true;

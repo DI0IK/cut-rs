@@ -117,7 +117,24 @@ pub fn apply_quota_snapshot(
     quotas.sort_by(|a, b| a.bucket_id.cmp(&b.bucket_id));
 
     let provider = payload.product.unwrap_or_else(|| "antigravity".to_string());
-    let tier = payload.plan_tier.unwrap_or_else(|| "unknown".to_string());
+    let tier = payload
+        .plan_tier
+        .filter(|t| !t.trim().is_empty() && !t.eq_ignore_ascii_case("unknown"))
+        .or_else(|| {
+            state
+                .tier
+                .clone()
+                .filter(|t| !t.trim().is_empty() && !t.eq_ignore_ascii_case("unknown"))
+        })
+        .or_else(|| {
+            state
+                .quota_snapshots
+                .iter()
+                .rev()
+                .find(|s| !s.tier.trim().is_empty() && !s.tier.eq_ignore_ascii_case("unknown"))
+                .map(|s| s.tier.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
 
     // Skip exact duplicate consecutive snapshots within 2s
     if let Some(last) = state.quota_snapshots.last()
