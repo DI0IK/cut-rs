@@ -678,7 +678,7 @@ mod tests {
             timestamp: t0,
         };
         let (_, changes1) = apply_token_and_quota_tick(&mut state, &tick1);
-        assert_eq!(changes1.len(), 1);
+        assert!(changes1.is_empty());
         assert_eq!(state.buckets["5h"].locked_reset_time, None);
 
         // Tick 2: still 100%, reset_time slides forward by 30s

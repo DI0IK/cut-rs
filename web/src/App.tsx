@@ -5,11 +5,100 @@ import { Predictor } from "./components/Predictor";
 import { HoverCard } from "./components/HoverCard";
 import {
   ChangeEvent,
+  CurrentBucketStatus,
   HistorySnapshotPoint,
   PartitionSummary,
+  QuotaSnapshotRow,
   QuotaStatusResponse,
   WindowEstimateView,
 } from "./types";
+
+interface PaceBudget {
+  periodLabel: "day" | "hour";
+  unitsLeft: number;
+  unitSuffix: "d" | "h";
+  startQuotaPct: number;
+  budgetPct: number;
+  usedPct: number;
+  usedRatioPct: number;
+}
+
+function computePaceBudget(
+  bucket: CurrentBucketStatus,
+  history: QuotaSnapshotRow[]
+): PaceBudget | null {
+  if (bucket.remaining_pct >= 99.999) return null;
+  if (!bucket.reset_time) return null;
+  const resetMs = Date.parse(bucket.reset_time);
+  if (Number.isNaN(resetMs)) return null;
+
+  const lowerId = bucket.bucket_id.toLowerCase();
+  const isWeekly = lowerId.includes("weekly") || lowerId.includes("week");
+  const isFiveH = lowerId.includes("5h");
+  if (!isWeekly && !isFiveH) return null;
+
+  const now = new Date();
+  const periodStartSec = isWeekly
+    ? Math.floor(
+        new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() /
+          1000
+      )
+    : Math.floor(
+        new Date(
+          now.getFullYear(),
+          now.getMonth(),
+          now.getDate(),
+          now.getHours()
+        ).getTime() / 1000
+      );
+
+  const unitSec = isWeekly ? 86400 : 3600;
+  const resetSec = Math.floor(resetMs / 1000);
+  if (resetSec <= Math.floor(now.getTime() / 1000)) return null;
+
+  const unitsLeft = Math.max(
+    1,
+    Math.ceil((resetSec - periodStartSec) / unitSec)
+  );
+
+  const bucketHist = history.filter((h) => h.bucket_id === bucket.bucket_id);
+  let beforePeriod: QuotaSnapshotRow | undefined;
+  let inPeriodFirst: QuotaSnapshotRow | undefined;
+  let inPeriodMax = bucket.remaining_pct;
+
+  for (const row of bucketHist) {
+    if (row.recorded_at <= periodStartSec) {
+      beforePeriod = row;
+    } else {
+      if (!inPeriodFirst) inPeriodFirst = row;
+      if (row.remaining_pct > inPeriodMax) inPeriodMax = row.remaining_pct;
+    }
+  }
+
+  let startQuotaPct =
+    beforePeriod?.remaining_pct ??
+    inPeriodFirst?.remaining_pct ??
+    bucket.remaining_pct;
+
+  // If the quota reset during the current day/hour, anchor to the post-reset peak
+  if (startQuotaPct < bucket.remaining_pct - 1e-3 || inPeriodMax > startQuotaPct + 1e-3) {
+    startQuotaPct = Math.max(inPeriodMax, bucket.remaining_pct);
+  }
+
+  const budgetPct = startQuotaPct / unitsLeft;
+  const usedPct = Math.max(0, startQuotaPct - bucket.remaining_pct);
+  const usedRatioPct = budgetPct > 0 ? (usedPct / budgetPct) * 100 : 0;
+
+  return {
+    periodLabel: isWeekly ? "day" : "hour",
+    unitsLeft,
+    unitSuffix: isWeekly ? "d" : "h",
+    startQuotaPct,
+    budgetPct,
+    usedPct,
+    usedRatioPct,
+  };
+}
 
 function formatResetCountdown(resetIso: string | null): string {
   if (!resetIso) return "reset unknown";
@@ -69,7 +158,7 @@ export function App() {
   const refreshData = useCallback(async () => {
     try {
       const [quotaResp, partResp] = await Promise.all([
-        fetch("/v1/quota"),
+        fetch("/v1/quota?limit=2000"),
         fetch("/v1/estimates"),
       ]);
 
@@ -289,6 +378,18 @@ export function App() {
               const pct = Math.max(0, Math.min(100, b.remaining_pct));
               const barColor =
                 pct < 20 ? "#ef4444" : pct < 50 ? "#f59e0b" : "#22c55e";
+              const pace = computePaceBudget(b, quotaStatus.history);
+              const paceBarPct = pace
+                ? Math.max(0, Math.min(100, pace.usedRatioPct))
+                : 0;
+              const paceColor = pace
+                ? pace.usedRatioPct >= 100
+                  ? "#ef4444"
+                  : pace.usedRatioPct >= 75
+                  ? "#f59e0b"
+                  : "#38bdf8"
+                : "#38bdf8";
+
               return (
                 <div
                   key={b.bucket_id}
@@ -331,8 +432,75 @@ export function App() {
                     />
                   </div>
                   <div style={{ fontSize: 11, opacity: 0.75 }}>
-                    {formatResetCountdown(b.reset_time)}
+                    {pct >= 99.999
+                      ? "Not started"
+                      : formatResetCountdown(b.reset_time)}
                   </div>
+
+                  {pace && (
+                    <div
+                      style={{
+                        marginTop: 10,
+                        paddingTop: 8,
+                        borderTop: "1px solid rgba(255,255,255,0.07)",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "baseline",
+                          fontSize: 11,
+                          marginBottom: 4,
+                        }}
+                      >
+                        <span style={{ opacity: 0.8 }}>
+                          {pace.periodLabel === "day" ? "Today" : "This hour"} (
+                          {pace.unitsLeft}
+                          {pace.unitSuffix} left)
+                        </span>
+                        <span style={{ fontWeight: 600 }}>
+                          {pace.usedPct.toFixed(1)}% / {pace.budgetPct.toFixed(1)}%
+                        </span>
+                      </div>
+                      <div
+                        style={{
+                          height: 5,
+                          borderRadius: 3,
+                          background: "rgba(255,255,255,0.08)",
+                          overflow: "hidden",
+                          marginBottom: 4,
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: `${paceBarPct}%`,
+                            height: "100%",
+                            background: paceColor,
+                            transition: "width 0.3s ease",
+                          }}
+                        />
+                      </div>
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          fontSize: 10,
+                          opacity: 0.65,
+                        }}
+                      >
+                        <span>
+                          Start of {pace.periodLabel}:{" "}
+                          {pace.startQuotaPct.toFixed(1)}%
+                        </span>
+                        <span>
+                          {pace.usedPct <= pace.budgetPct
+                            ? `${(pace.budgetPct - pace.usedPct).toFixed(1)}% left`
+                            : `${(pace.usedPct - pace.budgetPct).toFixed(1)}% over`}
+                        </span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })}

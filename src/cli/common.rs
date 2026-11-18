@@ -301,13 +301,15 @@ pub fn apply_token_and_quota_tick(
             });
 
         if is_new_bucket {
-            quota_changes.push(QuotaChangeRecord {
-                tier: tier.clone(),
-                bucket_id: q.bucket_id.clone(),
-                remaining_pct: (frac * 100.0).clamp(0.0, 100.0),
-                reset_time: tracker.effective_reset_time().map(str::to_string),
-                recorded_at: now,
-            });
+            if frac < 1.0 - 1e-7 {
+                quota_changes.push(QuotaChangeRecord {
+                    tier: tier.clone(),
+                    bucket_id: q.bucket_id.clone(),
+                    remaining_pct: (frac * 100.0).clamp(0.0, 100.0),
+                    reset_time: tracker.effective_reset_time().map(str::to_string),
+                    recorded_at: now,
+                });
+            }
             continue;
         }
 
@@ -336,7 +338,7 @@ pub fn apply_token_and_quota_tick(
             };
             tracker.started_at = now;
             tracker.pending_usage.clear();
-            if frac_changed {
+            if frac_changed && frac < 1.0 - 1e-7 {
                 quota_changes.push(QuotaChangeRecord {
                     tier: tier.clone(),
                     bucket_id: q.bucket_id.clone(),
