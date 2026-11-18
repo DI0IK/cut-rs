@@ -1,7 +1,6 @@
 use crate::math::nnls::solve_nnls;
 use crate::models::{
-    ClientRecord, ConfidenceInterval, Identifiability, IntervalRecord, ModelStatus,
-    ModelWeightEstimate, TokenMix,
+    ConfidenceInterval, Identifiability, IntervalRecord, ModelStatus, ModelWeightEstimate, TokenMix,
 };
 use nalgebra::{DMatrix, DVector};
 use statrs::distribution::{ContinuousCDF, StudentsT};
@@ -10,7 +9,6 @@ use std::collections::{BTreeMap, HashMap};
 const HALF_LIFE_DAYS: f64 = 14.0;
 const MAX_IRLS_ITERS: usize = 15;
 const IRLS_TOL: f64 = 1e-5;
-const CLIENT_CAP_FRAC: f64 = 0.05;
 
 #[derive(Debug, Clone)]
 pub struct IrlsFitResult {
@@ -19,7 +17,6 @@ pub struct IrlsFitResult {
     pub weights: Vec<f64>,
     pub covariance_matrix: Vec<f64>,
     pub sigma_hat: f64,
-    pub effective_contributors: f64,
     pub token_mix: TokenMix,
     pub residuals: Vec<f64>,
     pub assigned_weights: Vec<f64>,
@@ -27,7 +24,6 @@ pub struct IrlsFitResult {
 
 pub fn fit_irls_nnls(
     intervals: &[IntervalRecord],
-    clients: &HashMap<String, ClientRecord>,
     now: i64,
     model_stale_days: i64,
 ) -> Option<IrlsFitResult> {
@@ -110,7 +106,7 @@ pub fn fit_irls_nnls(
         }
     }
 
-    // 3. Initial sample weights: time-decay * inverse quantization variance * client trust
+    // 3. Initial sample weights: time-decay * inverse quantization variance
     let lambda = 0.5_f64.powf(1.0 / HALF_LIFE_DAYS);
     let mut init_weights = Vec::with_capacity(n);
     for iv in intervals {
@@ -120,15 +116,10 @@ pub fn fit_irls_nnls(
         let prec = iv.quota_precision.max(1e-6);
         let quant_w = (iv.delta_pct / prec).powi(2).min(1.0);
 
-        let trust_w = clients
-            .get(&iv.client_id)
-            .map(|c| c.trust_score.clamp(0.01, 1.0))
-            .unwrap_or(0.10);
-
-        init_weights.push((time_w * quant_w * trust_w).max(1e-6));
+        init_weights.push((time_w * quant_w).max(1e-6));
     }
 
-    let mut weights = enforce_client_cap(&init_weights, intervals, CLIENT_CAP_FRAC);
+    let mut weights = init_weights.clone();
     let mut w_vec = DVector::zeros(p);
 
     // 3b. High-breakdown LTS (Least Trimmed Squares) seed when n >= 12:
@@ -223,7 +214,7 @@ pub fn fit_irls_nnls(
                 for &(idx, _) in errs.iter().take(h) {
                     next_w[idx] = init_weights[idx];
                 }
-                cur_w = enforce_client_cap(&next_w, intervals, CLIENT_CAP_FRAC);
+                cur_w = next_w;
                 cur_vec = solve_subset(&cur_w);
             }
             let mut final_errs = eval_rel_sq(&cur_vec);
@@ -312,18 +303,17 @@ pub fn fit_irls_nnls(
             reweighted.push((init_weights[i] * huber).max(1e-8));
         }
 
-        weights = enforce_client_cap(&reweighted, intervals, CLIENT_CAP_FRAC);
+        weights = reweighted;
 
         if diff < IRLS_TOL && _iter > 0 && (n < 10 || _iter >= 6) {
             break;
         }
     }
 
-    // Final residuals and effective contributors
+    // Final residuals and token mix
     let preds = &x * &w_vec;
     let residuals: Vec<f64> = (0..n).map(|i| y[i] - preds[i]).collect();
 
-    let effective_contributors = compute_effective_contributors(&weights, intervals);
     let token_mix = compute_token_mix(&weights, intervals);
 
     // 5. Uncertainty & Covariance: Sigma_w = sigma_hat^2 * (X_active^T W X_active)^-1
@@ -489,84 +479,10 @@ pub fn fit_irls_nnls(
         weights: w_vec.as_slice().to_vec(),
         covariance_matrix,
         sigma_hat,
-        effective_contributors,
         token_mix,
         residuals,
         assigned_weights: weights,
     })
-}
-
-/// Enforces that no single `client_id` exceeds `cap_frac` (5%) of total effective weight.
-/// When distinct clients > 20, performs iterative water-filling so every client <= 5% of final sum.
-/// When distinct clients <= 20, caps each client's total weight at `cap_frac * total_initial_weight`.
-pub fn enforce_client_cap(
-    raw_weights: &[f64],
-    intervals: &[IntervalRecord],
-    cap_frac: f64,
-) -> Vec<f64> {
-    let n = raw_weights.len();
-    if n == 0 {
-        return vec![];
-    }
-
-    let mut client_totals: HashMap<&str, f64> = HashMap::new();
-    let mut total = 0.0;
-    for (i, iv) in intervals.iter().enumerate() {
-        let w = raw_weights[i].max(0.0);
-        *client_totals.entry(iv.client_id.as_str()).or_insert(0.0) += w;
-        total += w;
-    }
-
-    if total <= 0.0 {
-        return vec![0.0; n];
-    }
-
-    let num_clients = client_totals.len();
-    let mut client_scale: HashMap<&str, f64> = HashMap::new();
-
-    if num_clients as f64 * cap_frac <= 1.0 + 1e-9 {
-        // Fewer than ~20 clients: cap each client at cap_frac * total initial weight
-        let max_per_client = cap_frac * total;
-        for (&cid, &ctot) in &client_totals {
-            let scale = if ctot > max_per_client && ctot > 0.0 {
-                max_per_client / ctot
-            } else {
-                1.0
-            };
-            client_scale.insert(cid, scale);
-        }
-    } else {
-        // >= 21 clients: iterative water-filling so every client <= cap_frac of final total
-        let mut capped: HashMap<&str, f64> = client_totals.clone();
-        for _ in 0..10 {
-            let cur_total: f64 = capped.values().sum();
-            let limit = cap_frac * cur_total;
-            let mut changed = false;
-            for val in capped.values_mut() {
-                if *val > limit + 1e-12 {
-                    *val = limit;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        for (&cid, &orig) in &client_totals {
-            let target = *capped.get(cid).unwrap_or(&orig);
-            let scale = if orig > 0.0 { target / orig } else { 1.0 };
-            client_scale.insert(cid, scale);
-        }
-    }
-
-    intervals
-        .iter()
-        .enumerate()
-        .map(|(i, iv)| {
-            let s = client_scale.get(iv.client_id.as_str()).copied().unwrap_or(1.0);
-            raw_weights[i] * s
-        })
-        .collect()
 }
 
 pub fn compute_token_mix(weights: &[f64], intervals: &[IntervalRecord]) -> TokenMix {
@@ -612,20 +528,6 @@ fn compute_token_mix_filtered(
         in_share: sum_in / total,
         out_share: sum_out / total,
         cached_share: sum_cached / total,
-    }
-}
-
-pub fn compute_effective_contributors(weights: &[f64], intervals: &[IntervalRecord]) -> f64 {
-    let mut client_totals: HashMap<&str, f64> = HashMap::new();
-    for (i, iv) in intervals.iter().enumerate() {
-        *client_totals.entry(iv.client_id.as_str()).or_insert(0.0) += weights[i].max(0.0);
-    }
-    let sum_w: f64 = client_totals.values().sum();
-    let sum_w_sq: f64 = client_totals.values().map(|w| w * w).sum();
-    if sum_w_sq > 0.0 {
-        (sum_w * sum_w) / sum_w_sq
-    } else {
-        0.0
     }
 }
 
@@ -686,34 +588,15 @@ fn compute_condition_number(x: &DMatrix<f64>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{TrustTier, UsageEntry};
-
-    fn make_client(id: &str, trust_score: f64) -> ClientRecord {
-        ClientRecord {
-            client_id: id.to_string(),
-            created_at: 1_700_000_000,
-            subnet_hash: format!("sub_{id}"),
-            trust_score,
-            trust_tier: TrustTier::Trusted,
-            accepted_count: 50,
-            ema_abs_z: 0.2,
-            last_seen_at: 1_700_100_000,
-        }
-    }
+    use crate::models::UsageEntry;
 
     #[test]
     fn test_irls_recovers_weights_and_rejects_positive_outliers() {
         let now = 1_700_200_000;
-        let mut clients = HashMap::new();
-        for c in 0..25 {
-            let cid = format!("c{c}");
-            clients.insert(cid.clone(), make_client(&cid, 1.0));
-        }
 
         // True weights: in = 2.0, out = 10.0, cached = 0.2 pct per 1M
         let mut intervals = Vec::new();
         for i in 0..60 {
-            let cid = format!("c{}", i % 25);
             let t_in = 100_000 + (i as u64 * 17_000) % 500_000;
             let t_out = 20_000 + (i as u64 * 7_000) % 150_000;
             let t_cache = 50_000 + (i as u64 * 13_000) % 300_000;
@@ -729,7 +612,6 @@ mod tests {
             intervals.push(IntervalRecord {
                 id: i as i64 + 1,
                 idempotency_key: format!("k{i}"),
-                client_id: cid,
                 provider: "antigravity".to_string(),
                 tier: "pro".to_string(),
                 window_type: "5h".to_string(),
@@ -744,13 +626,11 @@ mod tests {
                     tokens_cached_in: t_cache,
                     request_count: 1,
                 }],
-                residual_pct: None,
-                weight_assigned: None,
                 ingested_at: now - 30,
             });
         }
 
-        let fit = fit_irls_nnls(&intervals, &clients, now, 14).expect("fit should succeed");
+        let fit = fit_irls_nnls(&intervals, now, 14).expect("fit should succeed");
         let est = &fit.models[0];
         assert!((est.pct_per_1m_in - 2.0).abs() < 0.2, "in={}", est.pct_per_1m_in);
         assert!((est.pct_per_1m_out - 10.0).abs() < 0.5, "out={}", est.pct_per_1m_out);
@@ -759,29 +639,16 @@ mod tests {
             "cache={}",
             est.pct_per_1m_cached_in
         );
-
-        // Verify 5% client cap is respected
-        let total_w: f64 = fit.assigned_weights.iter().sum();
-        let mut by_client: HashMap<&str, f64> = HashMap::new();
-        for (i, iv) in intervals.iter().enumerate() {
-            *by_client.entry(iv.client_id.as_str()).or_insert(0.0) += fit.assigned_weights[i];
-        }
-        for (_, cw) in by_client {
-            assert!(cw <= 0.0501 * total_w, "client weight {cw} exceeded 5% of {total_w}");
-        }
     }
 
     #[test]
     fn test_irls_enforces_monotonic_weights_on_tiny_sample() {
         let now = 1_700_000_000;
-        let mut clients = HashMap::new();
-        clients.insert("c1".to_string(), make_client("c1", 1.0));
 
         let intervals = vec![
             IntervalRecord {
                 id: 1,
                 idempotency_key: "m1".to_string(),
-                client_id: "c1".to_string(),
                 provider: "antigravity".to_string(),
                 tier: "pro".to_string(),
                 window_type: "gemini-5h".to_string(),
@@ -796,14 +663,11 @@ mod tests {
                     tokens_cached_in: 1_000_000,
                     request_count: 1,
                 }],
-                residual_pct: None,
-                weight_assigned: None,
                 ingested_at: now - 100,
             },
             IntervalRecord {
                 id: 2,
                 idempotency_key: "m2".to_string(),
-                client_id: "c1".to_string(),
                 provider: "antigravity".to_string(),
                 tier: "pro".to_string(),
                 window_type: "gemini-5h".to_string(),
@@ -818,13 +682,11 @@ mod tests {
                     tokens_cached_in: 2_000_000,
                     request_count: 1,
                 }],
-                residual_pct: None,
-                weight_assigned: None,
                 ingested_at: now - 10,
             },
         ];
 
-        let res = fit_irls_nnls(&intervals, &clients, now, 7).unwrap();
+        let res = fit_irls_nnls(&intervals, now, 7).unwrap();
         let m = &res.models[0];
         assert!(m.pct_per_1m_out >= m.pct_per_1m_in);
         assert!(m.pct_per_1m_in >= m.pct_per_1m_cached_in);
@@ -839,22 +701,6 @@ mod tests {
     #[test]
     fn test_irls_lts_seed_resists_30pct_positive_spikes() {
         let now = 1_700_000_000;
-        let mut clients = HashMap::new();
-        for c in 0..5 {
-            clients.insert(
-                format!("c{c}"),
-                ClientRecord {
-                    client_id: format!("c{c}"),
-                    subnet_hash: format!("s{c}"),
-                    trust_tier: TrustTier::Trusted,
-                    trust_score: 1.0,
-                    ema_abs_z: 0.0,
-                    accepted_count: 20,
-                    created_at: now - 86_400,
-                    last_seen_at: now,
-                },
-            );
-        }
 
         let mut intervals = Vec::new();
         for i in 0..20 {
@@ -872,7 +718,6 @@ mod tests {
             intervals.push(IntervalRecord {
                 id: i as i64 + 1,
                 idempotency_key: format!("lts-{i}"),
-                client_id: format!("c{}", i % 5),
                 provider: "antigravity".to_string(),
                 tier: "pro".to_string(),
                 window_type: "gemini-5h".to_string(),
@@ -887,13 +732,11 @@ mod tests {
                     tokens_cached_in: t_cache,
                     request_count: 1,
                 }],
-                residual_pct: None,
-                weight_assigned: None,
                 ingested_at: now - 990 + i * 20,
             });
         }
 
-        let res = fit_irls_nnls(&intervals, &clients, now, 14).unwrap();
+        let res = fit_irls_nnls(&intervals, now, 14).unwrap();
         let m = &res.models[0];
         assert!((m.pct_per_1m_in - 5.0).abs() < 0.1, "in={}", m.pct_per_1m_in);
         assert!(

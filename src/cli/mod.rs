@@ -1,16 +1,14 @@
 pub mod agy;
-pub mod agy_worker;
-pub mod claude;
-pub mod codex;
 pub mod common;
 pub mod init;
 pub mod status;
 pub mod waybar;
+pub mod webserver;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "cut-rs", about = "Crowdsourced AI quota telemetry server & CLI")]
+#[command(name = "cut-rs", about = "Local Antigravity AI quota tracker & cost estimator")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -18,21 +16,14 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Auto-detect installed AI coding tools and configure cut-rs hooks safely
+    /// Auto-detect Antigravity CLI & Waybar and configure cut-rs hooks safely
     Init(init::InitArgs),
-    /// Check server connectivity, hook configuration, pending telemetry, and local quota
+    /// Check hook configuration, local SQLite DB, webserver, and current quota
     Status(status::StatusArgs),
-    /// Run the HTTP telemetry ingestion and estimation server
-    #[command(alias = "server")]
-    Serve,
-    /// Process Antigravity CLI statusLine JSON from stdin and record quota snapshots
+    /// Process Antigravity CLI statusLine JSON from stdin and record quota/token intervals locally
     AgyCli(agy::AgyCliArgs),
-    /// Persistent background worker that reads Antigravity transcripts & conversation DBs
-    AgyWorker(agy_worker::AgyWorkerArgs),
-    /// Process Claude Code statusLine JSON from stdin and log quota telemetry
-    ClaudeCli(claude::ClaudeCliArgs),
-    /// Incrementally scan local Codex CLI rollout logs (~/.codex/sessions) and log telemetry
-    CodexCli(codex::CodexCliArgs),
-    /// Output Waybar custom module JSON aggregated from local tool quota states
+    /// Output Waybar custom module JSON from local Antigravity quota state
     Waybar(waybar::WaybarArgs),
+    /// Manage the on-demand local web dashboard server (start, stop, status)
+    Webserver(webserver::WebserverArgs),
 }

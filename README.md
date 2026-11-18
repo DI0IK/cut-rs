@@ -1,182 +1,75 @@
 # `cut-rs`
 
-A production-grade Rust backend service and local telemetry client that ingests crowdsourced AI quota consumption across providers and subscription tiers, estimates per-token quota costs (`tokens_in`, `tokens_out`, `tokens_cached_in`) in real time, resists Sybil poisoning, and detects silent provider pricing/quota shifts.
+A local-only, single-user Antigravity CLI quota tracker, Waybar module, and on-demand token cost estimator.
 
-Default public server & live dashboard: **`https://cut-rs.dominikstahl.dev`**
+- **Zero server required for tracking**: `cut-rs agy-cli` runs inline from Antigravity's `statusLine` hook, tails local transcripts, locks bucket expiry timestamps once quota drops below 100%, and writes `token -> % drop` intervals and historical quota snapshots to a local SQLite database (`~/.local/state/cut-rs/cut-rs.db`).
+- **On-demand statistical estimation**: Model token costs (`tokens_in`, `tokens_out`, `tokens_cached_in`) and historical timelines are computed on demand from SQLite—no background estimation daemon or auth tokens.
+- **Compact Waybar integration**: Displays remaining/used quota percentages in the bar and a clean hover tooltip with bucket reset countdowns.
+- **On-demand web dashboard**: Start or stop the local web UI whenever you want with `cut-rs webserver start --open` / `cut-rs webserver stop`.
 
 ---
 
-## 30-Second Quickstart
+## Quickstart
 
-**1. Install the binary:**
+### 1. Build or Install
 ```bash
-# Linux & macOS
-curl -fsSL https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.sh | sh
-```
-```powershell
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.ps1 | iex
-```
-*(Or download a prebuilt archive from [GitHub Releases](https://github.com/DI0IK/cut-rs/releases).)*
+# Using Cargo
+cargo install --path .
 
-**2. Auto-configure your AI coding tools & verify:**
+# Or using Nix
+nix build
+```
+
+### 2. Configure Antigravity CLI & Waybar
 ```bash
 cut-rs init
 cut-rs status
 ```
-`cut-rs init` configures **Antigravity CLI (Gemini)** and **Waybar** (verified), and also includes experimental adapters for **Claude Code** and **OpenAI Codex**. It backs up existing configs (`.bak`) and **prepends** `cut-rs --chain ...` if you already have a custom `statusLine` so your existing status line keeps working.
+`cut-rs init` updates `~/.gemini/antigravity-cli/settings.json` with `cut-rs agy-cli` (chaining any preexisting `statusLine` command via `--chain`) and prints the Waybar custom module snippet.
 
-> **Privacy & ToS:** Only token count deltas and quota `%` changes are sent. Prompts, code, and raw IP addresses are never collected or stored. All adapters use official local interfaces (`statusLine`, `notify`, local rollout logs).
-
----
-
-## Dashboard
-
-`cut-rs` serves an embedded React + TypeScript + Vite dashboard at `/` (bundled into the single binary via `rust-embed`):
-- **Quota Cost Timeline:** Compares models across sub-tiers and quota buckets over time using **Blended Mix** (weighted by the window's empirical crowdsourced `in / out / cached` token shares) or individual `OUT` / `IN` / `CACHED` breakdowns, with regime-shift markers.
-- **Active Model Weights & Predictor:** Displays `pct_per_1m_*` estimates with 95% confidence intervals, identifiability ratings, empirical cache rate, and an interactive Quota Predictor.
-- **Change Log:** Surfaces `regime_shift`, `model_added`, `model_retired`, `bucket_added`, and `bucket_retired` events.
-
----
-
-## Architecture & Statistical Pipeline
-
-All state and estimation are partitioned independently by `(provider, tier, window_type)` and discovered dynamically from incoming telemetry—supporting providers adding/retiring quota buckets or moving models between buckets without configuration changes.
-
-- **Web & Concurrency:** `axum` + `tower-http` (tracing, body size limits, timeouts, per-IP rate limiting) with a lock-free `DashMap` snapshot cache hydrated from SQLite (`WAL` mode, `synchronous = NORMAL`) and updated by a background Tokio worker.
-- **Solver (IRLS + Active-Set NNLS):**
-  - Lawson-Hanson Active-Set Non-Negative Least Squares (`nalgebra`).
-  - Sample weights combine 14-day exponential time-decay, inverse quantization variance, client `trust_score`, and a **5% per-client contribution cap**.
-  - **Asymmetric Huber clipping** ($\delta_+ = 0.8 \cdot \text{MAD}$ for positive residuals vs $\delta_- = 1.345 \cdot \text{MAD}$) down-weights unlogged usage from other devices/apps.
-  - Computes covariance $\Sigma_{\mathbf{w}}$, Student's $t$ 95% confidence intervals (`statrs`), SVD condition-number identifiability (`high`, `moderate`, `low_collinear`), and 95% prediction intervals.
-- **Change-Point Detection:** Two-sided CUSUM + dual-window F-test ($W_{\text{long}} = 1500$ vs $W_{\text{short}} = 60$), gated by an **anti-poisoning consensus rule** requiring $\ge 5$ distinct `trusted` clients across $\ge 3$ distinct `/24` IPv4 (`/48` IPv6) `subnet_hash` buckets.
-- **Anti-Sybil Auth:** Stateless HMAC-signed SHA-256 Proof-of-Work challenges (`GET /v1/auth/challenge`) with dynamic difficulty scaling, daily-salted subnet hashing (raw IPs are never persisted), and `probation` $\rightarrow$ `trusted` promotion.
-
----
-
-## HTTP API
-
-| Method | Path | Auth | Description |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/health` | Public | Health check |
-| `GET` | `/v1/auth/challenge` | Public | Issue PoW challenge (`difficulty_bits`, 120s TTL) |
-| `POST` | `/v1/auth/register` | Public | Verify PoW and issue `qt_<uuid>.<sig>` bearer token |
-| `POST` | `/v1/telemetry/intervals` | Bearer | Ingest interval batches (partial-success status per item) |
-| `GET` | `/v1/estimates` | Public | List all discovered `(provider, tier, window_type)` partitions & empirical token mix |
-| `GET` | `/v1/estimates/{provider}/{tier}` | Public | Active model weights, 95% CIs, identifiability, change events (`?window_type=`, `?include_stale=`) |
-| `GET` | `/v1/estimates/{provider}/{tier}/history` | Public | Historical snapshot timeline (`tier=all` supported, `?window_type=`, `?limit=`) |
-| `POST` | `/v1/estimates/{provider}/{tier}/predict` | Public | Predict quota % hit and 95% prediction interval |
-
----
-
-## Client & Desktop Integrations (ToS-Compliant)
-
-All client adapters use **only official, local interfaces** (no cookie extraction, no token spoofing, no private API scraping). By default, all client subcommands target `https://cut-rs.dominikstahl.dev` (override with `--server <URL>` or `CUT_RS_SERVER`) and share a single client registration:
-- **Linux:** `~/.local/state/cut-rs/auth.json`
-- **macOS:** `~/Library/Application Support/cut-rs/auth.json`
-- **Windows:** `%LOCALAPPDATA%\cut-rs\auth.json`
-
-### Install Prebuilt Binary (Linux / macOS / Windows)
-Download the latest release archive for your platform (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, or `x86_64-pc-windows-msvc`) from [GitHub Releases](https://github.com/DI0IK/cut-rs/releases), extract `cut-rs` (or `cut-rs.exe`), and place it on your `PATH`.
-
-### 1. Antigravity CLI (`cut-rs agy-cli`)
-Add to `~/.gemini/antigravity-cli/settings.json` (Windows: `%USERPROFILE%\.gemini\antigravity-cli\settings.json`):
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "cut-rs agy-cli",
-    "stack_with_default": true
-  }
-}
-```
-
-### 2. Claude Code CLI & IDE Extension (`cut-rs claude-cli`) *(Experimental / Untested)*
-Works with **Claude Code CLI** and **Claude Code IDE extensions** (VS Code / JetBrains / Claude Desktop Code tab) via `~/.claude/settings.json` (Windows: `%USERPROFILE%\.claude\settings.json`):
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "cut-rs claude-cli --tier pro"
-  }
-}
-```
-*(Set `--tier` or `CUT_RS_TIER` to `pro`, `max_5x`, `max_20x`, etc.)*
-
-### 3. OpenAI Codex CLI, Desktop App, & VS Code Extension (`cut-rs codex-cli`) *(Experimental / Untested)*
-Reads local session rollout logs (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, Windows: `%USERPROFILE%\.codex\sessions\...`) shared by **Codex CLI**, **Codex Desktop**, and the **Codex VS Code extension**:
-- **Codex `notify` hook** (`~/.codex/config.toml`):
-  ```toml
-  notify = ["cut-rs", "codex-cli"]
-  ```
-- **Continuous watcher** (e.g. for Codex Desktop / VS Code):
-  ```bash
-  cut-rs codex-cli --watch
-  ```
-
-### 4. Waybar Module (`cut-rs waybar`)
-Aggregates local quota state across all active tools and outputs Waybar JSON (`<5h>% / <weekly>%` + hover tooltip with reset countdowns):
+### 3. Waybar Module (`cut-rs waybar`)
+Add to `~/.config/waybar/config.jsonc`:
 ```jsonc
 "custom/cut-rs": {
-  "exec": "/path/to/cut-rs waybar --server https://cut-rs.dominikstahl.dev",
+  "exec": "cut-rs waybar",
   "return-type": "json",
-  "interval": 5,
-  "format": "󰚩 {}",
-  "tooltip": true
+  "interval": 15,
+  "format": "⚡ {text}"
 }
 ```
-Options: `--provider <name>`, `--show-used`, `--server <url>`.
+Pass `--show-used` if you prefer used `%` instead of remaining `%`.
+
+### 4. On-Demand Web Dashboard (`cut-rs webserver`)
+```bash
+cut-rs webserver start --open   # Starts background server on http://127.0.0.1:8080 and opens browser
+cut-rs webserver status         # Check PID & URL
+cut-rs webserver stop           # Stop background server
+```
+Use `--foreground` or `--port <PORT>` on `start` if needed.
 
 ---
 
-## Building & Deploying
+## Dashboard & HTTP API
 
-### Local Build & Tests
-```bash
-# Build embedded dashboard assets (required once before cargo build/test)
-devenv shell -- bash -c "cd web && npm install && npm run build"
+The embedded React + TypeScript + Vite dashboard (`web/dist`, bundled via `rust-embed`) provides:
+- **Current Quota Status**: Live remaining `%`, progress bars, and locked reset countdowns from `agy-cli-state.json`, plus historical quota snapshot count from SQLite.
+- **Quota Cost Timeline**: On-demand replay of per-model `pct_per_1m_*` estimates over time with cost-shift markers.
+- **Active Model Weights & Predictor**: Model cost table with 95% confidence intervals, identifiability ratings, and an interactive quota-hit predictor.
 
-devenv shell -- cargo build --release
-devenv shell -- cargo test
-devenv shell -- cargo clippy --all-targets -- -D warnings
-
-# Run the HTTP server
-./target/release/cut-rs serve
-```
-
-### NixOS Flake Deployment
-`flake.nix` provides `packages.<system>.default` and `nixosModules.default` (`services.cut-rs` with a hardened `systemd` unit):
-```nix
-{
-  inputs.cut-rs.url = "github:DI0IK/cut-rs";
-
-  outputs = { nixpkgs, cut-rs, ... }: {
-    nixosConfigurations.server = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        cut-rs.nixosModules.default
-        {
-          services.cut-rs = {
-            enable = true;
-            host = "127.0.0.1";
-            port = 8080;
-            trustProxyHeaders = true;
-            environmentFile = "/run/secrets/cut-rs-env"; # HMAC_SECRET=...
-          };
-        }
-      ];
-    };
-  };
-}
-```
-
-### Server Environment Variables
-| Variable | Default | Description |
+| Method | Path | Description |
 | :--- | :--- | :--- |
-| `HOST` | `0.0.0.0` | Bind address |
-| `PORT` | `8080` | Bind port |
-| `DATABASE_URL` | `sqlite://cut_rs.db?mode=rwc` | SQLite database URL |
-| `HMAC_SECRET` | *(ephemeral random)* | Secret key for PoW challenges, bearer tokens, and daily subnet salts |
-| `TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP` behind a reverse proxy |
-| `RATE_LIMIT_RPM` | `120` | Per-IP requests per minute |
-| `WORKER_INTERVAL_SECS` | `10` | Background estimation loop interval |
+| `GET` | `/health` | Health check |
+| `GET` | `/v1/quota` | Current quota buckets (`agy-cli-state.json`) & `quota_snapshots` history |
+| `GET` | `/v1/estimates` | Active `(tier, window_type)` partitions & empirical token mix |
+| `GET` | `/v1/estimates/{provider}/{tier}` | On-demand model weights, 95% CIs, identifiability, change events |
+| `GET` | `/v1/estimates/{provider}/{tier}/history` | On-demand historical timeline (`tier=all` supported) |
+| `POST` | `/v1/estimates/{provider}/{tier}/predict` | Predict quota `%` hit and 95% prediction interval |
+
+---
+
+## Statistical Pipeline
+
+All cost estimation runs on demand from the `intervals` table in SQLite:
+- **IRLS + Active-Set NNLS**: Lawson-Hanson non-negative least squares (`nalgebra`) with monotonic constraints (`w_out >= w_in >= w_cached >= 0`), 14-day exponential time-decay, and inverse quantization variance weighting.
+- **Outlier Resistance**: High-breakdown LTS seed + asymmetric Huber/Tukey clipping downweight positive spikes from unlogged usage (e.g. concurrent Antigravity IDE sessions).
+- **Change-Point Detection**: Two-sided CUSUM + dual-window F-test detects token-cost shifts and slices the active regime automatically.

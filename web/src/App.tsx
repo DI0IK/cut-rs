@@ -7,35 +7,38 @@ import {
   ChangeEvent,
   HistorySnapshotPoint,
   PartitionSummary,
+  QuotaStatusResponse,
   WindowEstimateView,
 } from "./types";
 
+function formatResetCountdown(resetIso: string | null): string {
+  if (!resetIso) return "reset unknown";
+  const target = Date.parse(resetIso);
+  if (Number.isNaN(target)) return `resets ${resetIso}`;
+  const secs = Math.floor((target - Date.now()) / 1000);
+  if (secs <= 0) return "resetting now";
+  const days = Math.floor(secs / 86400);
+  const hours = Math.floor((secs % 86400) / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  if (days > 0) return `resets in ${days}d ${hours}h`;
+  if (hours > 0) return `resets in ${hours}h ${mins}m`;
+  return `resets in ${mins}m`;
+}
+
 export function App() {
+  const provider = "antigravity";
   const [partitions, setPartitions] = useState<PartitionSummary[]>([]);
-  const [provider, setProvider] = useState<string>("");
   const [tier, setTier] = useState<string>("all");
   const [windowType, setWindowType] = useState<string>("all");
   const [metric, setMetric] = useState<CostMetric>("blended");
 
+  const [quotaStatus, setQuotaStatus] = useState<QuotaStatusResponse | null>(null);
   const [history, setHistory] = useState<HistorySnapshotPoint[]>([]);
   const [windowsByTier, setWindowsByTier] = useState<
     { tier: string; view: WindowEstimateView }[]
   >([]);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
-  const [showSetup, setShowSetup] = useState(false);
-  const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
-  const [onlyRegimeEvents, setOnlyRegimeEvents] = useState(false);
-
-  const copyCommand = (id: string, text: string) => {
-    navigator.clipboard?.writeText(text);
-    setCopiedCmd(id);
-    setTimeout(() => setCopiedCmd(null), 1500);
-  };
-
-  const providers = useMemo(
-    () => Array.from(new Set(partitions.map((p) => p.provider))).sort(),
-    [partitions]
-  );
+  const [onlyCostEvents, setOnlyCostEvents] = useState(false);
 
   const tiersForProvider = useMemo(
     () =>
@@ -44,7 +47,7 @@ export function App() {
           partitions.filter((p) => p.provider === provider).map((p) => p.tier)
         )
       ).sort(),
-    [partitions, provider]
+    [partitions]
   );
 
   const bucketsForSelection = useMemo(
@@ -60,24 +63,33 @@ export function App() {
             .map((p) => p.window_type)
         )
       ).sort(),
-    [partitions, provider, tier]
+    [partitions, tier]
   );
 
   const refreshData = useCallback(async () => {
     try {
-      const partResp = await fetch("/v1/estimates");
+      const [quotaResp, partResp] = await Promise.all([
+        fetch("/v1/quota"),
+        fetch("/v1/estimates"),
+      ]);
+
+      if (quotaResp.ok) {
+        const qData = (await quotaResp.json()) as QuotaStatusResponse;
+        setQuotaStatus(qData);
+      }
+
       if (!partResp.ok) return;
       const partData = (await partResp.json()) as {
         partitions: PartitionSummary[];
       };
       setPartitions(partData.partitions);
 
-      const activeProvider =
-        provider || partData.partitions[0]?.provider || "";
-      if (!provider && activeProvider) {
-        setProvider(activeProvider);
+      if (partData.partitions.length === 0) {
+        setHistory([]);
+        setWindowsByTier([]);
+        setLastUpdated(Date.now());
+        return;
       }
-      if (!activeProvider) return;
 
       const wtQuery =
         windowType && windowType !== "all"
@@ -85,7 +97,7 @@ export function App() {
           : "";
 
       const histResp = await fetch(
-        `/v1/estimates/${encodeURIComponent(activeProvider)}/${encodeURIComponent(
+        `/v1/estimates/${encodeURIComponent(provider)}/${encodeURIComponent(
           tier
         )}/history${wtQuery}`
       );
@@ -101,7 +113,7 @@ export function App() {
           ? Array.from(
               new Set(
                 partData.partitions
-                  .filter((p) => p.provider === activeProvider)
+                  .filter((p) => p.provider === provider)
                   .map((p) => p.tier)
               )
             )
@@ -110,7 +122,7 @@ export function App() {
       const allViews: { tier: string; view: WindowEstimateView }[] = [];
       for (const t of targetTiers) {
         const estResp = await fetch(
-          `/v1/estimates/${encodeURIComponent(activeProvider)}/${encodeURIComponent(
+          `/v1/estimates/${encodeURIComponent(provider)}/${encodeURIComponent(
             t
           )}${wtQuery}`
         );
@@ -128,7 +140,7 @@ export function App() {
     } catch {
       // Transient network error; next interval will retry
     }
-  }, [provider, tier, windowType]);
+  }, [tier, windowType]);
 
   useEffect(() => {
     refreshData();
@@ -163,15 +175,6 @@ export function App() {
     [windowsByTier]
   );
 
-  const maxContributors = useMemo(
-    () =>
-      windowsByTier.reduce(
-        (acc, w) => Math.max(acc, w.view.effective_contributors),
-        0
-      ),
-    [windowsByTier]
-  );
-
   const avgMix = useMemo(() => {
     if (windowsByTier.length === 0) {
       return { in_share: 0.05, out_share: 0.05, cached_share: 0.9 };
@@ -198,44 +201,24 @@ export function App() {
     const map = new Map<string, ChangeEvent>();
     for (const { view } of windowsByTier) {
       for (const ev of view.recent_change_events) {
-        if (onlyRegimeEvents && ev.event_type !== "regime_shift") continue;
+        if (onlyCostEvents && ev.event_type !== "cost_change") continue;
         map.set(`${ev.timestamp}-${ev.event_type}-${ev.description}`, ev);
       }
     }
     return Array.from(map.values())
       .sort((a, b) => b.timestamp - a.timestamp)
       .slice(0, 30);
-  }, [windowsByTier, onlyRegimeEvents]);
+  }, [windowsByTier, onlyCostEvents]);
 
   return (
     <div className="shell">
       <header className="topbar">
         <div className="brand">
           <h1>cut-rs</h1>
-          <span>AI Quota Telemetry</span>
+          <span>Antigravity Local Quota & Cost Tracker</span>
         </div>
 
         <div className="controls">
-          <select
-            className="select"
-            value={provider}
-            onChange={(e) => {
-              setProvider(e.target.value);
-              setTier("all");
-              setWindowType("all");
-            }}
-          >
-            {providers.length === 0 ? (
-              <option value="">no providers yet</option>
-            ) : (
-              providers.map((p) => (
-                <option key={p} value={p}>
-                  {p}
-                </option>
-              ))
-            )}
-          </select>
-
           <select
             className="select"
             value={tier}
@@ -269,14 +252,6 @@ export function App() {
             Refresh
           </button>
 
-          <button
-            type="button"
-            className="btn btn-accent"
-            onClick={() => setShowSetup(true)}
-          >
-            Setup CLI
-          </button>
-
           <a
             className="btn"
             href="https://github.com/DI0IK/cut-rs"
@@ -289,36 +264,100 @@ export function App() {
         </div>
       </header>
 
-      {providers.length === 0 && (
-        <div className="onboard-banner">
-          <span>
-            No telemetry data yet. Install the CLI in 30 seconds to contribute
-            anonymous quota samples from Claude Code, Codex, or Antigravity CLI.
+      <section className="panel">
+        <div className="panel-head">
+          <span className="panel-title">
+            Current Quota Status
+            {quotaStatus?.tier ? ` (${quotaStatus.tier})` : ""}
           </span>
-          <button
-            type="button"
-            className="btn btn-accent"
-            onClick={() => setShowSetup(true)}
-          >
-            Get Started
-          </button>
+          <span style={{ fontSize: 12, opacity: 0.7 }}>
+            {quotaStatus?.history.length
+              ? `${quotaStatus.history.length} historical snapshots`
+              : "local state"}
+          </span>
         </div>
-      )}
+        {quotaStatus && quotaStatus.buckets.length > 0 ? (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+              gap: 12,
+              padding: "8px 0",
+            }}
+          >
+            {quotaStatus.buckets.map((b) => {
+              const pct = Math.max(0, Math.min(100, b.remaining_pct));
+              const barColor =
+                pct < 20 ? "#ef4444" : pct < 50 ? "#f59e0b" : "#22c55e";
+              return (
+                <div
+                  key={b.bucket_id}
+                  style={{
+                    border: "1px solid var(--border, #2a2f3a)",
+                    borderRadius: 8,
+                    padding: "10px 12px",
+                    background: "rgba(255,255,255,0.02)",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "baseline",
+                      marginBottom: 6,
+                    }}
+                  >
+                    <strong style={{ fontSize: 13 }}>{b.bucket_id}</strong>
+                    <span style={{ fontSize: 14, fontWeight: 600 }}>
+                      {pct.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      height: 6,
+                      borderRadius: 3,
+                      background: "rgba(255,255,255,0.08)",
+                      overflow: "hidden",
+                      marginBottom: 6,
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${pct}%`,
+                        height: "100%",
+                        background: barColor,
+                        transition: "width 0.3s ease",
+                      }}
+                    />
+                  </div>
+                  <div style={{ fontSize: 11, opacity: 0.75 }}>
+                    {formatResetCountdown(b.reset_time)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div style={{ padding: "8px 0", fontSize: 13, opacity: 0.75 }}>
+            No Antigravity quota state found yet. Run <code>cut-rs init</code>{" "}
+            and use Antigravity CLI to start recording.
+          </div>
+        )}
+      </section>
 
       <section className="kpi-strip">
         <div className="kpi">
           <HoverCard
             card={
               <div className="hc-grid">
-                <div className="hc-title">Window Samples</div>
+                <div className="hc-title">Recorded Intervals</div>
                 <div className="hc-desc">
-                  Total quota-drop intervals in the current active regime across the selected
-                  buckets.
+                  Total quota-drop intervals in the selected buckets used for on-demand estimation.
                 </div>
               </div>
             }
           >
-            <div className="kpi-label hc-trigger">Window Samples</div>
+            <div className="kpi-label hc-trigger">Recorded Intervals</div>
           </HoverCard>
           <div className="kpi-val">{totalSamples}</div>
         </div>
@@ -326,31 +365,15 @@ export function App() {
           <HoverCard
             card={
               <div className="hc-grid">
-                <div className="hc-title">Effective Contributors</div>
+                <div className="hc-title">Token Mix</div>
                 <div className="hc-desc">
-                  Effective independent clients after the 5% per-client weight cap (anti-Sybil
-                  protection).
-                </div>
-              </div>
-            }
-          >
-            <div className="kpi-label hc-trigger">Eff. Contributors</div>
-          </HoverCard>
-          <div className="kpi-val">{maxContributors.toFixed(1)}</div>
-        </div>
-        <div className="kpi">
-          <HoverCard
-            card={
-              <div className="hc-grid">
-                <div className="hc-title">Crowdsourced Token Mix</div>
-                <div className="hc-desc">
-                  Empirical share of uncached input, output, and cached input tokens used to
+                  Your observed share of uncached input, output, and cached input tokens used to
                   compute the Blended cost rate.
                 </div>
               </div>
             }
           >
-            <div className="kpi-label hc-trigger">Crowdsourced Token Mix</div>
+            <div className="kpi-label hc-trigger">Token Mix</div>
           </HoverCard>
           <div className="kpi-val" style={{ fontSize: 13 }}>
             {(avgMix.in_share * 100).toFixed(0)}% in ·{" "}
@@ -359,7 +382,7 @@ export function App() {
           </div>
         </div>
         <div className="kpi">
-          <div className="kpi-label">Last Sync</div>
+          <div className="kpi-label">Last Refresh</div>
           <div className="kpi-val" style={{ fontSize: 13 }}>
             {lastUpdated ? new Date(lastUpdated).toLocaleTimeString() : "--"}
           </div>
@@ -380,137 +403,47 @@ export function App() {
 
       <section className="panel">
         <div className="panel-head">
-          <span className="panel-title">Change Events & Regime Shifts</span>
+          <span className="panel-title">Change Events & Cost Shifts</span>
           <div className="controls">
             <button
               type="button"
-              className={`btn btn-sm ${!onlyRegimeEvents ? "active" : ""}`}
-              onClick={() => setOnlyRegimeEvents(false)}
+              className={`btn btn-sm ${!onlyCostEvents ? "active" : ""}`}
+              onClick={() => setOnlyCostEvents(false)}
             >
               All
             </button>
             <button
               type="button"
-              className={`btn btn-sm ${onlyRegimeEvents ? "active" : ""}`}
-              onClick={() => setOnlyRegimeEvents(true)}
+              className={`btn btn-sm ${onlyCostEvents ? "active" : ""}`}
+              onClick={() => setOnlyCostEvents(true)}
             >
-              Regime shifts
+              Cost shifts
             </button>
           </div>
         </div>
-        <div className="panel-body">
-          {recentEvents.length === 0 ? (
-            <div className="empty-state" style={{ padding: 16 }}>
-              {onlyRegimeEvents ? "No regime shifts recorded yet." : "No change events recorded yet."}
-            </div>
-          ) : (
-            <ul className="events-list">
-              {recentEvents.map((ev, i) => (
-                <li key={`${ev.timestamp}-${i}`}>
-                  <span className="mono" style={{ color: "var(--ink-muted)" }}>
-                    {new Date(ev.timestamp * 1000).toLocaleString()}
-                  </span>
-                  <span className="badge">{ev.event_type}</span>
-                  <span>{ev.description}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </section>
-
-      {showSetup && (
-        <div
-          className="modal-backdrop"
-          role="dialog"
-          aria-modal="true"
-          onClick={() => setShowSetup(false)}
-        >
-          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-            <div className="panel-head">
-              <span className="panel-title">Contribute Telemetry (60s Setup)</span>
-              <button
-                type="button"
-                className="btn"
-                onClick={() => setShowSetup(false)}
+        {recentEvents.length === 0 ? (
+          <div className="empty">No change events recorded yet.</div>
+        ) : (
+          <div className="events-list">
+            {recentEvents.map((ev, idx) => (
+              <div
+                className="event-item"
+                key={`${ev.timestamp}-${ev.event_type}-${idx}`}
               >
-                Close
-              </button>
-            </div>
-            <div className="modal-body">
-              <p className="modal-lead">
-                Supports <strong>Claude Code</strong>, <strong>OpenAI Codex</strong>,{" "}
-                <strong>Antigravity CLI</strong>, and <strong>Waybar</strong> using
-                only official local interfaces.
-              </p>
-
-              <div className="setup-step">
-                <div className="setup-label">1. Install binary (Linux / macOS)</div>
-                <div className="code-row">
-                  <code>
-                    curl -fsSL https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.sh | sh
-                  </code>
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() =>
-                      copyCommand(
-                        "unix",
-                        "curl -fsSL https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.sh | sh"
-                      )
-                    }
-                  >
-                    {copiedCmd === "unix" ? "Copied" : "Copy"}
-                  </button>
-                </div>
+                <span className="event-time">
+                  {new Date(ev.timestamp * 1000).toLocaleString()}
+                </span>
+                <span className="event-desc">{ev.description}</span>
+                {ev.p_value !== undefined && ev.p_value !== null && (
+                  <span className="event-meta">
+                    p={ev.p_value.toExponential(2)}
+                  </span>
+                )}
               </div>
-
-              <div className="setup-step">
-                <div className="setup-label">1b. Install binary (Windows PowerShell)</div>
-                <div className="code-row">
-                  <code>
-                    irm https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.ps1 | iex
-                  </code>
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() =>
-                      copyCommand(
-                        "win",
-                        "irm https://raw.githubusercontent.com/DI0IK/cut-rs/main/scripts/install.ps1 | iex"
-                      )
-                    }
-                  >
-                    {copiedCmd === "win" ? "Copied" : "Copy"}
-                  </button>
-                </div>
-              </div>
-
-              <div className="setup-step">
-                <div className="setup-label">
-                  2. Auto-detect tools &amp; configure hooks safely
-                </div>
-                <div className="code-row">
-                  <code>cut-rs init &amp;&amp; cut-rs status</code>
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => copyCommand("init", "cut-rs init && cut-rs status")}
-                  >
-                    {copiedCmd === "init" ? "Copied" : "Copy"}
-                  </button>
-                </div>
-              </div>
-
-              <p className="modal-note">
-                Privacy: only token count deltas and quota % changes are submitted.
-                Prompts, code, and raw IP addresses are never collected or stored.
-                Preexisting <code>statusLine</code> commands are chained automatically.
-              </p>
-            </div>
+            ))}
           </div>
-        </div>
-      )}
+        )}
+      </section>
     </div>
   );
 }

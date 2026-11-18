@@ -27,15 +27,13 @@ export interface ModelWeightEstimate {
 export interface ChangeEvent {
   timestamp: number;
   event_type:
-    | "regime_shift"
+    | "cost_change"
     | "model_added"
     | "model_retired"
     | "bucket_added"
     | "bucket_retired";
   description: string;
   cusum_value?: number;
-  corroborating_clients?: number;
-  corroborating_subnets?: number;
   p_value?: number;
 }
 
@@ -44,7 +42,6 @@ export interface PartitionSummary {
   tier: string;
   window_type: string;
   sample_count_window: number;
-  effective_contributors: number;
   token_mix: TokenMix;
   stale: boolean;
   computed_at: number;
@@ -55,7 +52,6 @@ export interface WindowEstimateView {
   computed_at: number;
   regime_since: number;
   sample_count_window: number;
-  effective_contributors: number;
   sigma_hat: number;
   stale: boolean;
   token_mix: TokenMix;
@@ -76,7 +72,6 @@ export interface HistorySnapshotPoint {
   computed_at: number;
   regime_since: number;
   sample_count_window: number;
-  effective_contributors: number;
   token_mix: TokenMix;
   models: HistoryModelPoint[];
   recent_change_events: ChangeEvent[];
@@ -90,4 +85,27 @@ export interface PredictResponse {
   ci_95_lower: number;
   ci_95_upper: number;
   sigma_hat: number;
+}
+
+export interface CurrentBucketStatus {
+  bucket_id: string;
+  remaining_pct: number;
+  reset_time: string | null;
+  started_at: number;
+}
+
+export interface QuotaSnapshotRow {
+  id: number;
+  tier: string;
+  bucket_id: string;
+  remaining_pct: number;
+  reset_time: string | null;
+  recorded_at: number;
+}
+
+export interface QuotaStatusResponse {
+  provider: string;
+  tier: string | null;
+  buckets: CurrentBucketStatus[];
+  history: QuotaSnapshotRow[];
 }

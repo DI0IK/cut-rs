@@ -81,7 +81,7 @@ export function TimelineChart({ points, metric, onMetricChange }: Props) {
         pSet.add(pt.computed_at);
 
         for (const ev of pt.recent_change_events) {
-          if (ev.event_type === "regime_shift") {
+          if (ev.event_type === "cost_change") {
             markers.add(ev.timestamp);
           }
         }

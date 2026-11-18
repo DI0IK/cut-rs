@@ -1,15 +1,77 @@
 use crate::api::AppState;
+use crate::cli::common::load_state;
 use crate::error::AppError;
+use crate::estimator::{compute_partition_estimate, compute_partition_history};
+use crate::math::changepoint::W_LONG;
+use crate::math::irls::fit_irls_nnls;
 use crate::models::{
-    ChangeEvent, ModelStatus, ModelWeightEstimate, SnapshotPayload, TokenMix, UsageEntry,
-    normalize_key,
+    ChangeEvent, ModelStatus, ModelWeightEstimate, PartitionKey, QuotaSnapshotRow, TokenMix,
+    UsageEntry, normalize_key,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::IntoResponse;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+#[derive(Debug, Serialize)]
+pub struct CurrentBucketStatus {
+    pub bucket_id: String,
+    pub remaining_pct: f64,
+    pub reset_time: Option<String>,
+    pub started_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QuotaStatusResponse {
+    pub provider: String,
+    pub tier: Option<String>,
+    pub buckets: Vec<CurrentBucketStatus>,
+    pub history: Vec<QuotaSnapshotRow>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QuotaQuery {
+    pub bucket_id: Option<String>,
+    pub limit: Option<usize>,
+}
+
+pub async fn get_quota_status(
+    State(state): State<AppState>,
+    Query(query): Query<QuotaQuery>,
+) -> Result<Json<QuotaStatusResponse>, AppError> {
+    let cli_state = load_state(&state.config.state_file_path);
+    let tier = cli_state.as_ref().and_then(|s| s.tier.clone());
+    let mut buckets: Vec<CurrentBucketStatus> = cli_state
+        .map(|s| {
+            s.buckets
+                .into_iter()
+                .map(|(bucket_id, b)| CurrentBucketStatus {
+                    bucket_id,
+                    remaining_pct: (b.last_remaining_fraction * 100.0).clamp(0.0, 100.0),
+                    reset_time: b.effective_reset_time().map(str::to_string),
+                    started_at: b.started_at,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    buckets.sort_by(|a, b| a.bucket_id.cmp(&b.bucket_id));
+
+    let limit = query.limit.unwrap_or(500).clamp(1, 2000);
+    let history = state
+        .repo
+        .fetch_quota_history(query.bucket_id.as_deref(), limit)
+        .await?;
+
+    Ok(Json(QuotaStatusResponse {
+        provider: "antigravity".to_string(),
+        tier,
+        buckets,
+        history,
+    }))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct EstimatesQuery {
@@ -24,7 +86,6 @@ pub struct WindowEstimateView {
     pub computed_at: i64,
     pub regime_since: i64,
     pub sample_count_window: usize,
-    pub effective_contributors: f64,
     pub sigma_hat: f64,
     pub stale: bool,
     pub token_mix: TokenMix,
@@ -38,7 +99,6 @@ pub struct PartitionSummary {
     pub tier: String,
     pub window_type: String,
     pub sample_count_window: usize,
-    pub effective_contributors: f64,
     pub token_mix: TokenMix,
     pub stale: bool,
     pub computed_at: i64,
@@ -49,24 +109,27 @@ pub struct PartitionsResponse {
     pub partitions: Vec<PartitionSummary>,
 }
 
-pub async fn list_partitions(State(state): State<AppState>) -> Json<PartitionsResponse> {
-    let mut partitions: Vec<PartitionSummary> = state
-        .cache
-        .iter()
-        .map(|entry| {
-            let s = entry.value();
-            PartitionSummary {
-                provider: s.provider.clone(),
-                tier: s.tier.clone(),
-                window_type: s.window_type.clone(),
-                sample_count_window: s.sample_count_window,
-                effective_contributors: s.effective_contributors,
-                token_mix: s.token_mix,
-                stale: s.stale,
-                computed_at: s.computed_at,
-            }
-        })
-        .collect();
+pub async fn list_partitions(
+    State(state): State<AppState>,
+) -> Result<Json<PartitionsResponse>, AppError> {
+    let keys = state.repo.list_active_partitions().await?;
+    let now = Utc::now().timestamp();
+    let mut partitions = Vec::new();
+
+    for key in keys {
+        let intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+        if let Some(snap) = compute_partition_estimate(&key, &intervals, now, &state.config) {
+            partitions.push(PartitionSummary {
+                provider: snap.provider,
+                tier: snap.tier,
+                window_type: snap.window_type,
+                sample_count_window: snap.sample_count_window,
+                token_mix: snap.token_mix,
+                stale: snap.stale,
+                computed_at: snap.computed_at,
+            });
+        }
+    }
 
     partitions.sort_by(|a, b| {
         a.provider
@@ -75,7 +138,7 @@ pub async fn list_partitions(State(state): State<AppState>) -> Json<PartitionsRe
             .then(a.window_type.cmp(&b.window_type))
     });
 
-    Json(PartitionsResponse { partitions })
+    Ok(Json(PartitionsResponse { partitions }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,7 +162,6 @@ pub struct HistorySnapshotPoint {
     pub computed_at: i64,
     pub regime_since: i64,
     pub sample_count_window: usize,
-    pub effective_contributors: f64,
     pub token_mix: TokenMix,
     pub models: Vec<HistoryModelPoint>,
     pub recent_change_events: Vec<ChangeEvent>,
@@ -126,19 +188,6 @@ pub async fn get_estimates_history(
         .unwrap_or_else(|| "all".to_string());
     let limit = query.limit.unwrap_or(180).clamp(1, 500);
 
-    let cache_key = (provider_norm.clone(), tier_norm.clone(), wt_norm.clone());
-    if let Some(cached) = state.history_cache.get(&cache_key) {
-        let mut points = cached.value().clone();
-        if points.len() > limit {
-            points.truncate(limit);
-        }
-        return Ok(Json(HistoryResponse {
-            provider: provider_norm,
-            tier: tier_norm,
-            points,
-        }));
-    }
-
     let tier_filter = if tier_norm == "all" || tier_norm == "*" {
         None
     } else {
@@ -150,125 +199,54 @@ pub async fn get_estimates_history(
         Some(wt_norm.as_str())
     };
 
-    let matching_keys: Vec<_> = state
-        .cache
-        .iter()
-        .filter(|e| {
-            let k = e.key();
+    let all_keys = state.repo.list_active_partitions().await?;
+    let matching_keys: Vec<PartitionKey> = all_keys
+        .into_iter()
+        .filter(|k| {
             k.provider == provider_norm
                 && tier_filter.is_none_or(|t| k.tier == t)
                 && wt_filter.is_none_or(|w| k.window_type == w)
         })
-        .map(|e| (e.key().clone(), e.value().clone()))
         .collect();
 
+    let now = Utc::now().timestamp();
     let mut points = Vec::new();
-    for (key, snap) in matching_keys {
-        let mut intervals = state
-            .repo
-            .fetch_window_intervals(&key, snap.regime_since, crate::math::changepoint::W_LONG)
-            .await?;
+    for key in matching_keys {
+        let mut intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
         if intervals.is_empty() {
             continue;
         }
-        // Chronological order
         intervals.sort_by_key(|iv| (iv.ended_at, iv.id));
-        let client_ids: Vec<String> = intervals
-            .iter()
-            .map(|iv| iv.client_id.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let clients = state.repo.get_clients_by_ids(&client_ids).await?;
-
-        let n = intervals.len();
-        let max_checkpoints = 40usize;
-        let indices: Vec<usize> = if n <= max_checkpoints {
-            (1..=n).collect()
-        } else {
-            (0..max_checkpoints)
-                .map(|i| 1 + (i * (n - 1)) / (max_checkpoints - 1))
-                .collect()
-        };
-
-        let last_idx = indices.len().saturating_sub(1);
-        for (ci, &end_count) in indices.iter().enumerate() {
-            let slice = &intervals[..end_count];
-            let ts = slice.last().map(|iv| iv.ended_at).unwrap_or(snap.computed_at);
-            let Some(fit) = crate::math::irls::fit_irls_nnls(
-                slice,
-                &clients,
-                ts,
-                state.config.model_stale_days,
-            ) else {
-                continue;
-            };
-            if fit.models.is_empty() {
+        let snaps = compute_partition_history(&key, &intervals, now, &state.config, 40);
+        for s in snaps {
+            let active_models: Vec<HistoryModelPoint> = s
+                .models
+                .into_iter()
+                .filter(|m| m.status == ModelStatus::Active)
+                .map(|m| HistoryModelPoint {
+                    model: m.model,
+                    pct_per_1m_in: m.pct_per_1m_in,
+                    pct_per_1m_out: m.pct_per_1m_out,
+                    pct_per_1m_cached_in: m.pct_per_1m_cached_in,
+                })
+                .collect();
+            if active_models.is_empty() {
                 continue;
             }
             points.push(HistorySnapshotPoint {
-                tier: key.tier.clone(),
-                window_type: key.window_type.clone(),
-                computed_at: ts,
-                regime_since: snap.regime_since,
-                sample_count_window: slice.len(),
-                effective_contributors: fit.effective_contributors,
-                token_mix: fit.token_mix,
-                models: fit
-                    .models
-                    .into_iter()
-                    .filter(|m| m.status == ModelStatus::Active)
-                    .map(|m| HistoryModelPoint {
-                        model: m.model,
-                        pct_per_1m_in: m.pct_per_1m_in,
-                        pct_per_1m_out: m.pct_per_1m_out,
-                        pct_per_1m_cached_in: m.pct_per_1m_cached_in,
-                    })
-                    .collect(),
-                recent_change_events: if ci == last_idx {
-                    snap.recent_change_events.clone()
-                } else {
-                    Vec::new()
-                },
-            });
-        }
-    }
-
-    // Fallback to persisted snapshots if no intervals were found
-    if points.is_empty() {
-        let snaps = state
-            .repo
-            .load_snapshot_history(&provider_norm, tier_filter, wt_filter, limit)
-            .await?;
-        points = snaps
-            .into_iter()
-            .map(|s| HistorySnapshotPoint {
                 tier: s.tier,
                 window_type: s.window_type,
                 computed_at: s.computed_at,
                 regime_since: s.regime_since,
                 sample_count_window: s.sample_count_window,
-                effective_contributors: s.effective_contributors,
                 token_mix: s.token_mix,
-                models: s
-                    .models
-                    .into_iter()
-                    .filter(|m| m.status == ModelStatus::Active)
-                    .map(|m| HistoryModelPoint {
-                        model: m.model,
-                        pct_per_1m_in: m.pct_per_1m_in,
-                        pct_per_1m_out: m.pct_per_1m_out,
-                        pct_per_1m_cached_in: m.pct_per_1m_cached_in,
-                    })
-                    .collect(),
+                models: active_models,
                 recent_change_events: s.recent_change_events,
-            })
-            .collect();
-    } else {
-        points.sort_by_key(|p| p.computed_at);
+            });
+        }
     }
 
-    state.history_cache.insert(cache_key, points.clone());
+    points.sort_by_key(|p| p.computed_at);
     if points.len() > limit {
         points.truncate(limit);
     }
@@ -296,9 +274,11 @@ pub async fn get_estimates(
     let tier = normalize_key(&tier);
     let filter_window = query.window_type.as_deref().map(normalize_key);
 
+    let all_keys = state.repo.list_active_partitions().await?;
+    let now = Utc::now().timestamp();
     let mut windows = Vec::new();
-    for entry in state.cache.iter() {
-        let key = entry.key();
+
+    for key in all_keys {
         if key.provider != provider || key.tier != tier {
             continue;
         }
@@ -307,28 +287,29 @@ pub async fn get_estimates(
         {
             continue;
         }
-        let snap = entry.value();
+        let intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+        let Some(snap) = compute_partition_estimate(&key, &intervals, now, &state.config) else {
+            continue;
+        };
         if snap.stale && !query.include_stale {
             continue;
         }
         let active_models: Vec<ModelWeightEstimate> = snap
             .models
-            .iter()
+            .into_iter()
             .filter(|m| m.status == ModelStatus::Active || query.include_stale)
-            .cloned()
             .collect();
 
         windows.push(WindowEstimateView {
-            window_type: snap.window_type.clone(),
+            window_type: snap.window_type,
             computed_at: snap.computed_at,
             regime_since: snap.regime_since,
             sample_count_window: snap.sample_count_window,
-            effective_contributors: snap.effective_contributors,
             sigma_hat: snap.sigma_hat,
             stale: snap.stale,
             token_mix: snap.token_mix,
             models: active_models,
-            recent_change_events: snap.recent_change_events.clone(),
+            recent_change_events: snap.recent_change_events,
         });
     }
 
@@ -343,7 +324,7 @@ pub async fn get_estimates(
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=10"),
+        HeaderValue::from_static("no-cache"),
     );
 
     Ok((
@@ -386,25 +367,29 @@ pub async fn predict_quota(
     let tier = normalize_key(&tier);
     let target_wt = req.window_type.as_deref().map(normalize_key);
 
-    let mut candidates: Vec<SnapshotPayload> = state
-        .cache
-        .iter()
-        .filter(|e| {
-            let k = e.key();
+    let all_keys = state.repo.list_active_partitions().await?;
+    let mut keys: Vec<PartitionKey> = all_keys
+        .into_iter()
+        .filter(|k| {
             k.provider == provider
                 && k.tier == tier
                 && target_wt.as_ref().is_none_or(|wt| &k.window_type == wt)
         })
-        .map(|e| e.value().clone())
         .collect();
+    keys.sort_by(|a, b| a.window_type.cmp(&b.window_type));
 
-    candidates.sort_by(|a, b| a.stale.cmp(&b.stale).then(a.window_type.cmp(&b.window_type)));
-    let snap = candidates.into_iter().next().ok_or_else(|| {
-        AppError::NotFound(format!("no model snapshot available for {provider}/{tier}"))
+    let key = keys.into_iter().next().ok_or_else(|| {
+        AppError::NotFound(format!("no intervals available for {provider}/{tier}"))
     })?;
 
-    let p = snap.feature_names.len();
-    let feat_idx: HashMap<&str, usize> = snap
+    let intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+    let now = Utc::now().timestamp();
+    let fit = fit_irls_nnls(&intervals, now, state.config.model_stale_days).ok_or_else(|| {
+        AppError::NotFound(format!("insufficient data to predict for {provider}/{tier}"))
+    })?;
+
+    let p = fit.feature_names.len();
+    let feat_idx: HashMap<&str, usize> = fit
         .feature_names
         .iter()
         .enumerate()
@@ -414,7 +399,7 @@ pub async fn predict_quota(
     let mut x = vec![0.0_f64; p];
     let mut w = vec![0.0_f64; p];
 
-    for m in &snap.models {
+    for m in &fit.models {
         if let Some(&idx) = feat_idx.get(format!("{}:in", m.model).as_str()) {
             w[idx] = m.pct_per_1m_in;
         }
@@ -441,27 +426,26 @@ pub async fn predict_quota(
 
     let mu: f64 = x.iter().zip(w.iter()).map(|(xi, wi)| xi * wi).sum();
 
-    // Compute x^T * Sigma_w * x
     let mut x_cov_x = 0.0_f64;
-    if snap.covariance_matrix.len() == p * p {
+    if fit.covariance_matrix.len() == p * p {
         for r in 0..p {
             if x[r] == 0.0 {
                 continue;
             }
             for c in 0..p {
-                x_cov_x += x[r] * snap.covariance_matrix[r * p + c] * x[c];
+                x_cov_x += x[r] * fit.covariance_matrix[r * p + c] * x[c];
             }
         }
     }
-    let pred_se = (snap.sigma_hat.powi(2) + x_cov_x.max(0.0)).sqrt();
+    let pred_se = (fit.sigma_hat.powi(2) + x_cov_x.max(0.0)).sqrt();
 
     Ok(Json(PredictResponse {
         provider,
         tier,
-        window_type: snap.window_type,
+        window_type: key.window_type,
         expected_delta_pct: mu,
         ci_95_lower: (mu - 1.96 * pred_se).max(0.0),
         ci_95_upper: mu + 1.96 * pred_se,
-        sigma_hat: snap.sigma_hat,
+        sigma_hat: fit.sigma_hat,
     }))
 }

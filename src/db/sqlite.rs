@@ -1,10 +1,9 @@
 use crate::db::{NewInterval, TelemetryRepository};
 use crate::error::AppError;
-use crate::models::{ClientRecord, IntervalRecord, PartitionKey, SnapshotPayload, TrustTier, UsageEntry};
+use crate::models::{IntervalRecord, PartitionKey, QuotaSnapshotRow, UsageEntry};
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -20,7 +19,6 @@ impl SqliteRepository {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
@@ -43,111 +41,19 @@ impl SqliteRepository {
 
 #[async_trait]
 impl TelemetryRepository for SqliteRepository {
-    async fn insert_client(&self, client: &ClientRecord) -> Result<(), AppError> {
-        sqlx::query(
-            r#"
-            INSERT INTO clients (
-                client_id, created_at, subnet_hash, trust_score,
-                trust_tier, accepted_count, ema_abs_z, last_seen_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            "#,
-        )
-        .bind(&client.client_id)
-        .bind(client.created_at)
-        .bind(&client.subnet_hash)
-        .bind(client.trust_score)
-        .bind(client.trust_tier.as_str())
-        .bind(client.accepted_count)
-        .bind(client.ema_abs_z)
-        .bind(client.last_seen_at)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    async fn get_client(&self, client_id: &str) -> Result<Option<ClientRecord>, AppError> {
-        let row = sqlx::query(
-            r#"
-            SELECT client_id, created_at, subnet_hash, trust_score,
-                   trust_tier, accepted_count, ema_abs_z, last_seen_at
-            FROM clients
-            WHERE client_id = ?1
-            "#,
-        )
-        .bind(client_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(|r| ClientRecord {
-            client_id: r.get("client_id"),
-            created_at: r.get("created_at"),
-            subnet_hash: r.get("subnet_hash"),
-            trust_score: r.get("trust_score"),
-            trust_tier: TrustTier::from_db(r.get("trust_tier")),
-            accepted_count: r.get("accepted_count"),
-            ema_abs_z: r.get("ema_abs_z"),
-            last_seen_at: r.get("last_seen_at"),
-        }))
-    }
-
-    async fn get_clients_by_ids(
-        &self,
-        client_ids: &[String],
-    ) -> Result<HashMap<String, ClientRecord>, AppError> {
-        let mut map = HashMap::new();
-        if client_ids.is_empty() {
-            return Ok(map);
-        }
-
-        // Chunk to stay well within SQLite bind parameter limits (999)
-        for chunk in client_ids.chunks(500) {
-            let placeholders: Vec<String> =
-                (1..=chunk.len()).map(|i| format!("?{i}")).collect();
-            let sql = format!(
-                "SELECT client_id, created_at, subnet_hash, trust_score, \
-                        trust_tier, accepted_count, ema_abs_z, last_seen_at \
-                 FROM clients WHERE client_id IN ({})",
-                placeholders.join(",")
-            );
-            let mut query = sqlx::query(&sql);
-            for id in chunk {
-                query = query.bind(id);
-            }
-            let rows = query.fetch_all(&self.pool).await?;
-            for r in rows {
-                let rec = ClientRecord {
-                    client_id: r.get("client_id"),
-                    created_at: r.get("created_at"),
-                    subnet_hash: r.get("subnet_hash"),
-                    trust_score: r.get("trust_score"),
-                    trust_tier: TrustTier::from_db(r.get("trust_tier")),
-                    accepted_count: r.get("accepted_count"),
-                    ema_abs_z: r.get("ema_abs_z"),
-                    last_seen_at: r.get("last_seen_at"),
-                };
-                map.insert(rec.client_id.clone(), rec);
-            }
-        }
-        Ok(map)
-    }
-
     async fn insert_interval_if_new(&self, interval: &NewInterval) -> Result<bool, AppError> {
         let usage_json = serde_json::to_string(&interval.usage)
             .map_err(|e| AppError::Internal(e.into()))?;
 
-        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             r#"
             INSERT OR IGNORE INTO intervals (
-                idempotency_key, client_id, provider, tier, window_type,
+                idempotency_key, tier, window_type,
                 started_at, ended_at, delta_pct, quota_precision, usage_json, ingested_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
         )
         .bind(&interval.idempotency_key)
-        .bind(&interval.client_id)
-        .bind(&interval.provider)
         .bind(&interval.tier)
         .bind(&interval.window_type)
         .bind(interval.started_at)
@@ -156,34 +62,18 @@ impl TelemetryRepository for SqliteRepository {
         .bind(interval.quota_precision)
         .bind(&usage_json)
         .bind(interval.ingested_at)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?;
 
-        let inserted = res.rows_affected() > 0;
-        if inserted {
-            sqlx::query(
-                r#"
-                UPDATE clients
-                SET accepted_count = accepted_count + 1,
-                    last_seen_at = MAX(last_seen_at, ?2)
-                WHERE client_id = ?1
-                "#,
-            )
-            .bind(&interval.client_id)
-            .bind(interval.ingested_at)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(inserted)
+        Ok(res.rows_affected() > 0)
     }
 
     async fn list_active_partitions(&self) -> Result<Vec<PartitionKey>, AppError> {
         let rows = sqlx::query(
             r#"
-            SELECT DISTINCT provider, tier, window_type
+            SELECT DISTINCT tier, window_type
             FROM intervals
-            ORDER BY provider, tier, window_type
+            ORDER BY tier, window_type
             "#,
         )
         .fetch_all(&self.pool)
@@ -191,10 +81,12 @@ impl TelemetryRepository for SqliteRepository {
 
         Ok(rows
             .into_iter()
-            .map(|r| PartitionKey {
-                provider: r.get("provider"),
-                tier: r.get("tier"),
-                window_type: r.get("window_type"),
+            .map(|r| {
+                PartitionKey::new(
+                    "antigravity",
+                    r.get::<String, _>("tier").as_str(),
+                    r.get::<String, _>("window_type").as_str(),
+                )
             })
             .collect())
     }
@@ -207,17 +99,14 @@ impl TelemetryRepository for SqliteRepository {
     ) -> Result<Vec<IntervalRecord>, AppError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, idempotency_key, client_id, provider, tier, window_type,
-                   started_at, ended_at, delta_pct, quota_precision, usage_json,
-                   residual_pct, weight_assigned, ingested_at
+            SELECT id, idempotency_key, tier, window_type,
+                   started_at, ended_at, delta_pct, quota_precision, usage_json, ingested_at
             FROM intervals
-            WHERE provider = ?1 AND tier = ?2 AND window_type = ?3
-              AND ingested_at >= ?4
+            WHERE tier = ?1 AND window_type = ?2 AND ingested_at >= ?3
             ORDER BY ingested_at DESC, id DESC
-            LIMIT ?5
+            LIMIT ?4
             "#,
         )
-        .bind(&key.provider)
         .bind(&key.tier)
         .bind(&key.window_type)
         .bind(since_ts)
@@ -227,14 +116,13 @@ impl TelemetryRepository for SqliteRepository {
 
         let mut records = Vec::with_capacity(rows.len());
         for r in rows {
-            let usage_str: String = r.get("usage_json");
-            let usage: Vec<UsageEntry> = serde_json::from_str(&usage_str)
+            let usage_json: String = r.get("usage_json");
+            let usage: Vec<UsageEntry> = serde_json::from_str(&usage_json)
                 .map_err(|e| AppError::Internal(e.into()))?;
             records.push(IntervalRecord {
                 id: r.get("id"),
                 idempotency_key: r.get("idempotency_key"),
-                client_id: r.get("client_id"),
-                provider: r.get("provider"),
+                provider: "antigravity".to_string(),
                 tier: r.get("tier"),
                 window_type: r.get("window_type"),
                 started_at: r.get("started_at"),
@@ -242,146 +130,88 @@ impl TelemetryRepository for SqliteRepository {
                 delta_pct: r.get("delta_pct"),
                 quota_precision: r.get("quota_precision"),
                 usage,
-                residual_pct: r.get("residual_pct"),
-                weight_assigned: r.get("weight_assigned"),
                 ingested_at: r.get("ingested_at"),
             });
         }
-        // Return in chronological order (oldest -> newest) for CUSUM & time ordering
         records.reverse();
         Ok(records)
     }
 
-    async fn update_interval_fits(&self, updates: &[(i64, f64, f64)]) -> Result<(), AppError> {
-        if updates.is_empty() {
-            return Ok(());
-        }
-        let mut tx = self.pool.begin().await?;
-        for &(id, residual_pct, weight_assigned) in updates {
-            sqlx::query(
-                r#"
-                UPDATE intervals
-                SET residual_pct = ?2, weight_assigned = ?3
-                WHERE id = ?1
-                "#,
-            )
-            .bind(id)
-            .bind(residual_pct)
-            .bind(weight_assigned)
-            .execute(&mut *tx)
+    async fn count_intervals(&self) -> Result<i64, AppError> {
+        let row = sqlx::query("SELECT COUNT(*) AS cnt FROM intervals")
+            .fetch_one(&self.pool)
             .await?;
-        }
-        tx.commit().await?;
-        Ok(())
+        Ok(row.get::<i64, _>("cnt"))
     }
 
-    async fn update_client_trust(
+    async fn insert_quota_snapshot(
         &self,
-        client_id: &str,
-        trust_score: f64,
-        trust_tier: TrustTier,
-        ema_abs_z: f64,
+        tier: &str,
+        bucket_id: &str,
+        remaining_pct: f64,
+        reset_time: Option<&str>,
+        recorded_at: i64,
     ) -> Result<(), AppError> {
         sqlx::query(
             r#"
-            UPDATE clients
-            SET trust_score = ?2, trust_tier = ?3, ema_abs_z = ?4
-            WHERE client_id = ?1
+            INSERT INTO quota_snapshots (tier, bucket_id, remaining_pct, reset_time, recorded_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
             "#,
         )
-        .bind(client_id)
-        .bind(trust_score)
-        .bind(trust_tier.as_str())
-        .bind(ema_abs_z)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn save_snapshot(&self, snapshot: &SnapshotPayload) -> Result<(), AppError> {
-        let weights_json =
-            serde_json::to_string(snapshot).map_err(|e| AppError::Internal(e.into()))?;
-        sqlx::query(
-            r#"
-            INSERT INTO model_snapshots (
-                provider, tier, window_type, computed_at, regime_since,
-                sample_count, effective_contributors, weights_json, cusum_pos, cusum_neg
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            "#,
-        )
-        .bind(&snapshot.provider)
-        .bind(&snapshot.tier)
-        .bind(&snapshot.window_type)
-        .bind(snapshot.computed_at)
-        .bind(snapshot.regime_since)
-        .bind(snapshot.sample_count_window as i64)
-        .bind(snapshot.effective_contributors)
-        .bind(&weights_json)
-        .bind(snapshot.cusum_pos)
-        .bind(snapshot.cusum_neg)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn load_latest_snapshots(&self) -> Result<Vec<SnapshotPayload>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT ms.weights_json
-            FROM model_snapshots ms
-            INNER JOIN (
-                SELECT provider, tier, window_type, MAX(id) AS max_id
-                FROM model_snapshots
-                GROUP BY provider, tier, window_type
-            ) latest
-            ON ms.id = latest.max_id
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let json_str: String = r.get("weights_json");
-            let snap: SnapshotPayload = serde_json::from_str(&json_str)
-                .map_err(|e| AppError::Internal(e.into()))?;
-            out.push(snap);
-        }
-        Ok(out)
-    }
-
-    async fn load_snapshot_history(
-        &self,
-        provider: &str,
-        tier: Option<&str>,
-        window_type: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<SnapshotPayload>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT weights_json
-            FROM model_snapshots
-            WHERE provider = ?1
-              AND (?2 IS NULL OR tier = ?2)
-              AND (?3 IS NULL OR window_type = ?3)
-            ORDER BY computed_at DESC, id DESC
-            LIMIT ?4
-            "#,
-        )
-        .bind(provider)
         .bind(tier)
-        .bind(window_type)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
+        .bind(bucket_id)
+        .bind(remaining_pct)
+        .bind(reset_time)
+        .bind(recorded_at)
+        .execute(&self.pool)
         .await?;
+        Ok(())
+    }
 
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let json_str: String = r.get("weights_json");
-            let snap: SnapshotPayload = serde_json::from_str(&json_str)
-                .map_err(|e| AppError::Internal(e.into()))?;
-            out.push(snap);
-        }
+    async fn fetch_quota_history(
+        &self,
+        bucket_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<QuotaSnapshotRow>, AppError> {
+        let rows = if let Some(bid) = bucket_id {
+            sqlx::query(
+                r#"
+                SELECT id, tier, bucket_id, remaining_pct, reset_time, recorded_at
+                FROM quota_snapshots
+                WHERE bucket_id = ?1
+                ORDER BY recorded_at DESC, id DESC
+                LIMIT ?2
+                "#,
+            )
+            .bind(bid)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, tier, bucket_id, remaining_pct, reset_time, recorded_at
+                FROM quota_snapshots
+                ORDER BY recorded_at DESC, id DESC
+                LIMIT ?1
+                "#,
+            )
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        let mut out: Vec<QuotaSnapshotRow> = rows
+            .into_iter()
+            .map(|r| QuotaSnapshotRow {
+                id: r.get("id"),
+                tier: r.get("tier"),
+                bucket_id: r.get("bucket_id"),
+                remaining_pct: r.get("remaining_pct"),
+                reset_time: r.get("reset_time"),
+                recorded_at: r.get("recorded_at"),
+            })
+            .collect();
         out.reverse();
         Ok(out)
     }
