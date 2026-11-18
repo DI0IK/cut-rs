@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CostMetric, TimelineChart } from "./components/TimelineChart";
+import { QuotaBurndownChart } from "./components/QuotaBurndownChart";
 import { ModelTable, ModelTableRow } from "./components/ModelTable";
 import { Predictor } from "./components/Predictor";
 import { HoverCard } from "./components/HoverCard";
@@ -550,6 +551,8 @@ export function App() {
           </div>
         </div>
       </section>
+
+      <QuotaBurndownChart history={quotaStatus?.history ?? []} />
 
       <TimelineChart points={history} metric={metric} onMetricChange={setMetric} />
 
