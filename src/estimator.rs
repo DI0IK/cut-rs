@@ -35,8 +35,6 @@ pub fn compute_partition_history(
 
     let mut out = Vec::with_capacity(sample_ends.len());
     let mut regime_start_idx = 0usize;
-    let mut cusum_pos = 0.0;
-    let mut cusum_neg = 0.0;
     let mut prev_active: Option<HashSet<String>> = None;
     let mut events: Vec<ChangeEvent> = vec![ChangeEvent {
         timestamp: intervals[0].ingested_at,
@@ -67,12 +65,10 @@ pub fn compute_partition_history(
             window,
             &fit.residuals,
             fit.sigma_hat,
-            cusum_pos,
-            cusum_neg,
+            0.0,
+            0.0,
             point_ts,
         );
-        cusum_pos = cp.cusum_pos;
-        cusum_neg = cp.cusum_neg;
 
         let curr_active: HashSet<String> = fit
             .models

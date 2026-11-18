@@ -25,7 +25,7 @@ pub fn evaluate_changepoint(
     prev_cusum_neg: f64,
     now: i64,
 ) -> ChangePointResult {
-    if intervals.is_empty() || residuals.len() != intervals.len() || sigma_hat <= 1e-9 {
+    if intervals.len() < 30 || residuals.len() != intervals.len() {
         return ChangePointResult {
             cusum_pos: prev_cusum_pos,
             cusum_neg: prev_cusum_neg,
@@ -34,12 +34,13 @@ pub fn evaluate_changepoint(
         };
     }
 
+    let eff_sigma = sigma_hat.max(0.01);
     let probe_start = intervals.len().saturating_sub(W_SHORT);
     let mut s_pos = prev_cusum_pos * 0.5;
     let mut s_neg = prev_cusum_neg * 0.5;
 
     for &res in &residuals[probe_start..] {
-        let z = (res / sigma_hat).clamp(-5.0, 5.0);
+        let z = (res / eff_sigma).clamp(-5.0, 5.0);
         s_pos = (s_pos + z - CUSUM_K).max(0.0);
         s_neg = (s_neg - z - CUSUM_K).max(0.0);
     }
@@ -56,7 +57,7 @@ pub fn evaluate_changepoint(
     let direction = if s_pos >= s_neg { 1.0 } else { -1.0 };
     let shift_count = residuals[probe_start..]
         .iter()
-        .filter(|&&r| (r / sigma_hat) * direction > 1.5)
+        .filter(|&&r| (r / eff_sigma) * direction > 1.5)
         .count();
 
     let p_value = dual_window_f_test_p_value(residuals, probe_start);
