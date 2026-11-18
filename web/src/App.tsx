@@ -53,36 +53,30 @@ function computePaceBudget(
       );
 
   const unitSec = isWeekly ? 86400 : 3600;
+  const windowDurationSec = isWeekly ? 7 * 86400 : 5 * 3600;
+  const nowSec = Math.floor(now.getTime() / 1000);
   const resetSec = Math.floor(resetMs / 1000);
-  if (resetSec <= Math.floor(now.getTime() / 1000)) return null;
+  if (resetSec <= nowSec) return null;
 
-  const unitsLeft = Math.max(
-    1,
-    Math.ceil((resetSec - periodStartSec) / unitSec)
-  );
+  const windowStartSec = resetSec - windowDurationSec;
+  const unitsLeft = Math.max(1, Math.ceil((resetSec - nowSec) / unitSec));
 
-  const bucketHist = history.filter((h) => h.bucket_id === bucket.bucket_id);
-  let beforePeriod: QuotaSnapshotRow | undefined;
-  let inPeriodFirst: QuotaSnapshotRow | undefined;
-  let inPeriodMax = bucket.remaining_pct;
-
-  for (const row of bucketHist) {
-    if (row.recorded_at <= periodStartSec) {
-      beforePeriod = row;
-    } else {
-      if (!inPeriodFirst) inPeriodFirst = row;
-      if (row.remaining_pct > inPeriodMax) inPeriodMax = row.remaining_pct;
+  let startQuotaPct = 100.0;
+  if (windowStartSec < periodStartSec) {
+    const bucketHist = history.filter((h) => h.bucket_id === bucket.bucket_id);
+    let beforePeriod: QuotaSnapshotRow | undefined;
+    for (const row of bucketHist) {
+      if (row.recorded_at <= periodStartSec) {
+        beforePeriod = row;
+      }
     }
-  }
-
-  let startQuotaPct =
-    beforePeriod?.remaining_pct ??
-    inPeriodFirst?.remaining_pct ??
-    bucket.remaining_pct;
-
-  // If the quota reset during the current day/hour, anchor to the post-reset peak
-  if (startQuotaPct < bucket.remaining_pct - 1e-3 || inPeriodMax > startQuotaPct + 1e-3) {
-    startQuotaPct = Math.max(inPeriodMax, bucket.remaining_pct);
+    if (
+      beforePeriod &&
+      beforePeriod.reset_time === bucket.reset_time &&
+      beforePeriod.remaining_pct >= bucket.remaining_pct - 1e-3
+    ) {
+      startQuotaPct = beforePeriod.remaining_pct;
+    }
   }
 
   const budgetPct = startQuotaPct / unitsLeft;
