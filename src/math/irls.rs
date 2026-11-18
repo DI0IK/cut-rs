@@ -610,7 +610,7 @@ mod tests {
             }
 
             intervals.push(IntervalRecord {
-                id: i as i64 + 1,
+                id: i + 1,
                 idempotency_key: format!("k{i}"),
                 provider: "antigravity".to_string(),
                 tier: "pro".to_string(),
@@ -716,7 +716,7 @@ mod tests {
                 0.0
             };
             intervals.push(IntervalRecord {
-                id: i as i64 + 1,
+                id: i + 1,
                 idempotency_key: format!("lts-{i}"),
                 provider: "antigravity".to_string(),
                 tier: "pro".to_string(),
