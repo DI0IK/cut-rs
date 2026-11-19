@@ -38,7 +38,7 @@
 
           web = pkgs.buildNpmPackage {
             pname = "cut-rs-web";
-            version = "0.4.4";
+            version = "0.4.5";
             src = lib.cleanSourceWith {
               src = ./web;
               filter = path: type:
@@ -60,7 +60,7 @@
           inherit web;
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "cut-rs";
-            version = "0.4.4";
+            version = "0.4.5";
             inherit src;
 
             cargoLock.lockFile = ./Cargo.lock;
