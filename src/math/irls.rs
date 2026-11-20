@@ -54,16 +54,18 @@ pub fn fit_irls_nnls(
         }
     }
 
-    // Keep models that have >= min_support, and if any model in this bucket has a solo
-    // interval, require solo_count >= 1 to exclude cross-bucket spillover models.
-    let min_support = if intervals.len() < 10 { 1 } else { 2 };
+    // Keep models that have >= 1 sample; only exclude a model as cross-bucket spillover
+    // if it has >= 5 samples and 0 solo intervals while another model in this bucket has solo intervals.
     let any_has_solo = model_counts
         .keys()
         .any(|m| solo_counts.get(m).copied().unwrap_or(0) >= 1);
     let active_models: Vec<String> = model_counts
         .iter()
         .filter(|&(m, &cnt)| {
-            cnt >= min_support && (!any_has_solo || solo_counts.get(m).copied().unwrap_or(0) >= 1)
+            cnt >= 1
+                && (!any_has_solo
+                    || cnt < 5
+                    || solo_counts.get(m).copied().unwrap_or(0) >= 1)
         })
         .map(|(m, _)| m.clone())
         .collect();
@@ -109,29 +111,59 @@ pub fn fit_irls_nnls(
     // 3. Initial sample weights: time-decay * inverse quantization variance
     let lambda = 0.5_f64.powf(1.0 / HALF_LIFE_DAYS);
     let mut init_weights = Vec::with_capacity(n);
-    for iv in intervals {
+    for (i, iv) in intervals.iter().enumerate() {
         let dt_days = ((now - iv.ended_at).max(0) as f64) / 86_400.0;
         let time_w = lambda.powf(dt_days);
 
         let prec = iv.quota_precision.max(1e-6);
         let quant_w = (iv.delta_pct / prec).powi(2).min(1.0);
 
-        init_weights.push((time_w * quant_w).max(1e-6));
+        let mut w = (time_w * quant_w).max(1e-6);
+
+        // Downweight consecutive identical-delta_pct bursts (e.g. from quota oscillation)
+        if i > 0
+            && iv.delta_pct > 0.05
+            && (iv.delta_pct - intervals[i - 1].delta_pct).abs() < 1e-5
+            && (iv.ended_at - intervals[i - 1].ended_at).abs() <= 300
+        {
+            w = (w * 1e-3).max(1e-8);
+        }
+
+        init_weights.push(w);
     }
 
     let mut weights = init_weights.clone();
     let mut w_vec = DVector::zeros(p);
 
-    // 3b. High-breakdown LTS (Least Trimmed Squares) seed when n >= 12:
+    // Per-model adaptive ridge penalty on isotonic step deltas (d_in_step, d_out_step)
+    // to prevent extreme corner solutions when a model has few samples or collinear tokens.
+    let mut step_ridge = vec![0.0_f64; p];
+    for (m_idx, m_name) in active_models.iter().enumerate() {
+        let cnt = *model_counts.get(m_name).unwrap_or(&0);
+        if cnt < 10 {
+            let scale = ((10 - cnt) as f64 / 10.0) * 1e-2;
+            let base = m_idx * 3;
+            step_ridge[base + 1] = scale;
+            step_ridge[base + 2] = scale;
+        }
+    }
+    let ridge_rows: Vec<usize> = step_ridge
+        .iter()
+        .enumerate()
+        .filter_map(|(j, &r)| if r > 0.0 { Some(j) } else { None })
+        .collect();
+    let r_count = ridge_rows.len();
+
+    // 3b. High-breakdown LTS (Least Trimmed Squares) seed when n >= 6 and n > p:
     // Prevents a 20-35% cluster of positive unlogged-usage spikes from pulling
     // iteration-0 OLS into a bad local basin and inflating MAD.
-    if n >= 12 && p <= 12 {
+    if n >= 6.max(p + 1) && p <= 24 {
         let h = ((n as f64) * 0.60).ceil() as usize;
         let h = h.max(p + 1).min(n);
 
         let solve_subset = |subset_weights: &[f64]| -> DVector<f64> {
-            let mut a_iso = DMatrix::zeros(n, p);
-            let mut b = DVector::zeros(n);
+            let mut a_iso = DMatrix::zeros(n + r_count, p);
+            let mut b = DVector::zeros(n + r_count);
             for i in 0..n {
                 let sw = subset_weights[i].sqrt();
                 b[i] = y[i] * sw;
@@ -144,6 +176,9 @@ pub fn fit_irls_nnls(
                     a_iso[(i, base + 1)] = (t_in + t_out) * sw;
                     a_iso[(i, base + 2)] = t_out * sw;
                 }
+            }
+            for (r_idx, &col_j) in ridge_rows.iter().enumerate() {
+                a_iso[(n + r_idx, col_j)] = step_ridge[col_j];
             }
             let delta = solve_nnls(&a_iso, &b);
             let mut w = DVector::zeros(p);
@@ -231,8 +266,8 @@ pub fn fit_irls_nnls(
     // 4. IRLS loop wrapping monotonic Active-Set NNLS (w_out >= w_in >= w_cached >= 0 per model)
     let num_models = active_models.len();
     for _iter in 0..MAX_IRLS_ITERS {
-        let mut a_iso = DMatrix::zeros(n, p);
-        let mut b = DVector::zeros(n);
+        let mut a_iso = DMatrix::zeros(n + r_count, p);
+        let mut b = DVector::zeros(n + r_count);
         for i in 0..n {
             let sw = weights[i].sqrt();
             b[i] = y[i] * sw;
@@ -245,6 +280,9 @@ pub fn fit_irls_nnls(
                 a_iso[(i, base + 1)] = (t_in + t_out) * sw;
                 a_iso[(i, base + 2)] = t_out * sw;
             }
+        }
+        for (r_idx, &col_j) in ridge_rows.iter().enumerate() {
+            a_iso[(n + r_idx, col_j)] = step_ridge[col_j];
         }
 
         let delta = solve_nnls(&a_iso, &b);
@@ -407,10 +445,6 @@ pub fn fit_irls_nnls(
         let w_in = w_vec[base];
         let w_out = w_vec[base + 1];
         let w_cache = w_vec[base + 2];
-
-        if m_count > 1 && w_in <= 1e-4 && w_out <= 1e-4 && w_cache <= 1e-4 {
-            continue;
-        }
 
         let se_in = cov[(base, base)].max(0.0).sqrt();
         let se_out = cov[(base + 1, base + 1)].max(0.0).sqrt();
@@ -748,6 +782,106 @@ mod tests {
             (m.pct_per_1m_cached_in - 0.25).abs() < 0.01,
             "cached={}",
             m.pct_per_1m_cached_in
+        );
+    }
+
+    #[test]
+    fn test_irls_downweights_duplicate_delta_bursts_and_keeps_sparse_models() {
+        let now = 1_700_000_000;
+        let mut intervals = Vec::new();
+
+        // 10 clean intervals for model-a at 2.0 pct / 1M in
+        for i in 0..10 {
+            intervals.push(IntervalRecord {
+                id: i + 1,
+                idempotency_key: format!("clean-{i}"),
+                provider: "antigravity".to_string(),
+                tier: "pro".to_string(),
+                window_type: "gemini-5h".to_string(),
+                started_at: now - 2000 + i * 60,
+                ended_at: now - 1990 + i * 60,
+                delta_pct: 0.2 * ((i + 1) as f64),
+                quota_precision: 0.0001,
+                usage: vec![UsageEntry {
+                    model: "model-a".to_string(),
+                    tokens_in: 100_000 * ((i + 1) as u64),
+                    tokens_out: 0,
+                    tokens_cached_in: 0,
+                    request_count: 1,
+                }],
+                ingested_at: now - 1990 + i * 60,
+            });
+        }
+
+        // 5 consecutive duplicate-delta bounce bursts (4.0 pct with tiny tokens)
+        for i in 0..5 {
+            intervals.push(IntervalRecord {
+                id: 20 + i,
+                idempotency_key: format!("dup-{i}"),
+                provider: "antigravity".to_string(),
+                tier: "pro".to_string(),
+                window_type: "gemini-5h".to_string(),
+                started_at: now - 500 + i * 10,
+                ended_at: now - 495 + i * 10,
+                delta_pct: 4.0,
+                quota_precision: 0.0001,
+                usage: vec![UsageEntry {
+                    model: "model-a".to_string(),
+                    tokens_in: 5_000,
+                    tokens_out: 500,
+                    tokens_cached_in: 0,
+                    request_count: 1,
+                }],
+                ingested_at: now - 495 + i * 10,
+            });
+        }
+
+        // 1 mixed interval introducing sparse model-b
+        intervals.push(IntervalRecord {
+            id: 30,
+            idempotency_key: "sparse-b".to_string(),
+            provider: "antigravity".to_string(),
+            tier: "pro".to_string(),
+            window_type: "gemini-5h".to_string(),
+            started_at: now - 100,
+            ended_at: now - 90,
+            delta_pct: 0.5,
+            quota_precision: 0.0001,
+            usage: vec![
+                UsageEntry {
+                    model: "model-a".to_string(),
+                    tokens_in: 100_000,
+                    tokens_out: 0,
+                    tokens_cached_in: 0,
+                    request_count: 1,
+                },
+                UsageEntry {
+                    model: "model-b".to_string(),
+                    tokens_in: 100_000,
+                    tokens_out: 5_000,
+                    tokens_cached_in: 500_000,
+                    request_count: 1,
+                },
+            ],
+            ingested_at: now - 90,
+        });
+
+        let fit = fit_irls_nnls(&intervals, now, 14).expect("fit should succeed");
+        let a = fit.models.iter().find(|m| m.model == "model-a").unwrap();
+        assert!(
+            (a.pct_per_1m_in - 2.0).abs() < 0.5,
+            "model-a should resist duplicate-delta burst, got in={}",
+            a.pct_per_1m_in
+        );
+        let b = fit
+            .models
+            .iter()
+            .find(|m| m.model == "model-b")
+            .expect("sparse model-b should not be dropped");
+        assert!(
+            b.pct_per_1m_out < 50.0,
+            "ridge should prevent extreme out-weight explosion, got out={}",
+            b.pct_per_1m_out
         );
     }
 }

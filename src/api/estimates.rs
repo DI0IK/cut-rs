@@ -117,7 +117,8 @@ pub async fn list_partitions(
     let mut partitions = Vec::new();
 
     for key in keys {
-        let intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+        let mut intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+        intervals.sort_by_key(|iv| (iv.ended_at, iv.id));
         if let Some(snap) = compute_partition_estimate(&key, &intervals, now, &state.config) {
             partitions.push(PartitionSummary {
                 provider: snap.provider,
@@ -287,7 +288,8 @@ pub async fn get_estimates(
         {
             continue;
         }
-        let intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+        let mut intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+        intervals.sort_by_key(|iv| (iv.ended_at, iv.id));
         let Some(snap) = compute_partition_estimate(&key, &intervals, now, &state.config) else {
             continue;
         };

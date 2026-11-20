@@ -5,7 +5,7 @@ pub const W_LONG: usize = 1500;
 pub const W_SHORT: usize = 60;
 const CUSUM_K: f64 = 0.5;
 const CUSUM_H: f64 = 6.0;
-const RECENT_TAIL: usize = 6;
+pub const RECENT_TAIL: usize = 6;
 const MIN_RECENT_SHIFTED: usize = 4;
 const REL_NOISE_FLOOR: f64 = 0.04;
 const MIN_Z_SHIFT: f64 = 0.75;
@@ -137,8 +137,9 @@ pub fn evaluate_changepoint(
         && (median_z >= MIN_Z_SHIFT || median_rel.is_some_and(|mr| mr >= MIN_REL_SHIFT));
 
     let p_value = dual_window_f_test_p_value(residuals, probe_start);
+    let f_significant = p_value.is_some_and(|p| p < 0.05);
 
-    if sustained {
+    if sustained && f_significant {
         let cusum_val = pos_score.max(neg_score);
         let dir_label = if direction > 0.0 {
             "increase"
@@ -328,5 +329,27 @@ mod tests {
         );
         let ev = res.event.expect("expected cost_change event");
         assert!(ev.description.contains("decrease"));
+    }
+
+    #[test]
+    fn test_insignificant_f_test_does_not_trigger_regime_change() {
+        let mut intervals = Vec::new();
+        let mut residuals = Vec::new();
+
+        // High-variance noisy baseline with a small recent shift where F-test p >= 0.05
+        for i in 0..30 {
+            intervals.push(make_iv(i));
+            residuals.push(if i % 2 == 0 { 0.8 } else { -0.8 });
+        }
+        for i in 0..6 {
+            intervals.push(make_iv(30 + i));
+            residuals.push(0.25);
+        }
+
+        let res = evaluate_changepoint(&intervals, &residuals, 0.1, 0.0, 0.0, 500);
+        assert!(
+            !res.regime_changed,
+            "insignificant F-test should not trigger regime change"
+        );
     }
 }

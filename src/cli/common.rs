@@ -327,7 +327,11 @@ pub fn apply_token_and_quota_tick(
             _ => false,
         };
 
-        if frac > tracker.last_remaining_fraction + 1e-6 || reset_jumped {
+        let is_genuine_reset = reset_jumped
+            || (frac >= 1.0 - 1e-4 && tracker.last_remaining_fraction < 1.0 - 1e-3)
+            || frac > tracker.last_remaining_fraction + 0.15;
+
+        if is_genuine_reset {
             let frac_changed = (frac - tracker.last_remaining_fraction).abs() > 1e-7;
             tracker.last_remaining_fraction = frac;
             tracker.last_reset_time = q.reset_time.clone();
@@ -347,6 +351,12 @@ pub fn apply_token_and_quota_tick(
                     recorded_at: now,
                 });
             }
+            continue;
+        }
+
+        // Ignore small upward bounces from stale/cached quota responses without raising
+        // the cycle's low-water mark or clearing pending_usage.
+        if frac > tracker.last_remaining_fraction + 1e-6 {
             continue;
         }
 
@@ -432,4 +442,78 @@ pub fn apply_token_and_quota_tick(
 
 pub fn epoch_to_rfc3339(epoch_secs: i64) -> Option<String> {
     DateTime::<Utc>::from_timestamp(epoch_secs, 0).map(|dt| dt.to_rfc3339())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quota_bounce_does_not_reemit_or_clear_pending_usage() {
+        let mut state = CliToolState::default();
+        let reset = Some("2026-11-21T00:02:05Z".to_string());
+
+        let make_tick = |ts: i64, frac: f64, tok_in: u64, reset_time: Option<String>| TickInput {
+            session_id: "s1".to_string(),
+            provider: "antigravity".to_string(),
+            tier: "pro".to_string(),
+            multi_deltas: if tok_in > 0 {
+                vec![ModelDelta {
+                    model: "gemini 4".to_string(),
+                    tokens_in: tok_in,
+                    tokens_out: 100,
+                    tokens_cached_in: 0,
+                    request_count: 1,
+                }]
+            } else {
+                vec![]
+            },
+            skip_emit: false,
+            quota_precision: Some(0.0001),
+            quotas: vec![QuotaSample {
+                bucket_id: "gemini-5h".to_string(),
+                remaining_fraction: frac,
+                reset_time,
+            }],
+            timestamp: ts,
+        };
+
+        // Initial baseline at 0.3453
+        let (e0, _) = apply_token_and_quota_tick(&mut state, &make_tick(100, 0.3453, 0, reset.clone()));
+        assert_eq!(e0, 0);
+
+        // Drop to 0.3412 -> emits 1 interval
+        let (e1, _) = apply_token_and_quota_tick(&mut state, &make_tick(110, 0.3412, 10_000, reset.clone()));
+        assert_eq!(e1, 1);
+
+        // Bounce back up to 0.3453 with same reset_time -> ignored, pending_usage preserved
+        let (e2, _) = apply_token_and_quota_tick(&mut state, &make_tick(120, 0.3453, 5_000, reset.clone()));
+        assert_eq!(e2, 0);
+        assert_eq!(
+            state.buckets["gemini-5h"].pending_usage["gemini 4"].tokens_in,
+            5_000
+        );
+
+        // Return to 0.3412 -> should NOT re-emit duplicate 0.3453 -> 0.3412 interval
+        let (e3, _) = apply_token_and_quota_tick(&mut state, &make_tick(130, 0.3412, 5_000, reset.clone()));
+        assert_eq!(e3, 0);
+        assert_eq!(
+            state.buckets["gemini-5h"].pending_usage["gemini 4"].tokens_in,
+            10_000
+        );
+
+        // Genuine new drop to 0.3350 -> emits 1 interval with all accumulated 10_000 tokens
+        let (e4, _) = apply_token_and_quota_tick(&mut state, &make_tick(140, 0.3350, 0, reset));
+        assert_eq!(e4, 1);
+        assert_eq!(state.pending_intervals.len(), 2);
+        assert_eq!(state.pending_intervals[1].usage[0].tokens_in, 10_000);
+
+        // Genuine reset to 1.0000 -> resets low-water mark
+        let (e5, _) = apply_token_and_quota_tick(
+            &mut state,
+            &make_tick(150, 1.0, 0, Some("2026-11-21T05:02:05Z".to_string())),
+        );
+        assert_eq!(e5, 0);
+        assert!((state.buckets["gemini-5h"].last_remaining_fraction - 1.0).abs() < 1e-6);
+    }
 }
