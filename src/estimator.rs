@@ -36,6 +36,7 @@ pub fn compute_partition_history(
 
     let mut out = Vec::with_capacity(sample_ends.len());
     let mut regime_start_idx = 0usize;
+    let mut pre_regime_rate: Option<f64> = None;
     let mut prev_status: Option<HashMap<String, ModelStatus>> = None;
     let mut last_known_estimates: HashMap<String, ModelWeightEstimate> = HashMap::new();
     let mut events: Vec<ChangeEvent> = vec![ChangeEvent {
@@ -48,6 +49,39 @@ pub fn compute_partition_history(
 
     for end in sample_ends {
         let long_start = end.saturating_sub(W_LONG);
+
+        // If a previous regime_changed was triggered by a transient burst and the most recent
+        // RECENT_TAIL samples have reverted to the pre-regime rate, recover the full window.
+        if regime_start_idx > long_start
+            && end >= regime_start_idx + RECENT_TAIL * 2
+            && let Some(base_rate) = pre_regime_rate
+        {
+            let tail_rates: Vec<f64> = intervals[end - RECENT_TAIL..end]
+                .iter()
+                .filter_map(|iv| {
+                    let tot: u64 = iv
+                        .usage
+                        .iter()
+                        .map(|u| u.tokens_in + u.tokens_out + u.tokens_cached_in)
+                        .sum();
+                    if tot > 0 {
+                        Some(iv.delta_pct / (tot as f64 / 1_000_000.0))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if tail_rates.len() >= RECENT_TAIL / 2 {
+                let mut sorted = tail_rates;
+                sorted.sort_by(|a, b| a.total_cmp(b));
+                let med_tail = sorted[sorted.len() / 2];
+                if (med_tail - base_rate).abs() <= base_rate.abs() * 0.5 + 0.5 {
+                    regime_start_idx = long_start;
+                    pre_regime_rate = None;
+                }
+            }
+        }
+
         let win_start = regime_start_idx.max(long_start);
         let window = &intervals[win_start..end];
         if window.is_empty() {
@@ -187,6 +221,25 @@ pub fn compute_partition_history(
             events.push(ev);
         }
         if cp.regime_changed {
+            let mut base_rates: Vec<f64> = window[..window.len().saturating_sub(RECENT_TAIL)]
+                .iter()
+                .filter_map(|iv| {
+                    let tot: u64 = iv
+                        .usage
+                        .iter()
+                        .map(|u| u.tokens_in + u.tokens_out + u.tokens_cached_in)
+                        .sum();
+                    if tot > 0 {
+                        Some(iv.delta_pct / (tot as f64 / 1_000_000.0))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !base_rates.is_empty() {
+                base_rates.sort_by(|a, b| a.total_cmp(b));
+                pre_regime_rate = Some(base_rates[base_rates.len() / 2]);
+            }
             regime_start_idx = end.saturating_sub(RECENT_TAIL);
         }
 
@@ -286,6 +339,95 @@ mod tests {
                 .iter()
                 .any(|e| e.event_type == ChangeEventType::ModelRetired),
             "non-stale model-a should not emit ModelRetired"
+        );
+    }
+
+    #[test]
+    fn test_transient_spike_burst_recovers_baseline_window() {
+        let now = 1_795_210_000;
+        let key = PartitionKey::new("antigravity", "pro", "gemini-5h");
+        let config = Config::test_default("sqlite::memory:".to_string(), "/tmp/s.json".into());
+
+        let mut intervals = Vec::new();
+        // 30 baseline intervals at 1.0 pct / 1M in
+        for i in 0..30 {
+            intervals.push(IntervalRecord {
+                id: i + 1,
+                idempotency_key: format!("base-{i}"),
+                provider: "antigravity".to_string(),
+                tier: "pro".to_string(),
+                window_type: "gemini-5h".to_string(),
+                started_at: now - 5000 + i * 30,
+                ended_at: now - 4990 + i * 30,
+                delta_pct: 1.0,
+                quota_precision: 0.01,
+                usage: vec![UsageEntry {
+                    model: "model-a".to_string(),
+                    tokens_in: 1_000_000,
+                    tokens_out: 0,
+                    tokens_cached_in: 0,
+                    request_count: 1,
+                }],
+                ingested_at: now - 4990 + i * 30,
+            });
+        }
+        // 6 transient spike intervals at 10.0 pct / 1M in
+        for i in 0..6 {
+            intervals.push(IntervalRecord {
+                id: 31 + i,
+                idempotency_key: format!("burst-{i}"),
+                provider: "antigravity".to_string(),
+                tier: "pro".to_string(),
+                window_type: "gemini-5h".to_string(),
+                started_at: now - 2000 + i * 30,
+                ended_at: now - 1990 + i * 30,
+                delta_pct: 10.0,
+                quota_precision: 0.01,
+                usage: vec![UsageEntry {
+                    model: "model-b".to_string(),
+                    tokens_in: 1_000_000,
+                    tokens_out: 0,
+                    tokens_cached_in: 0,
+                    request_count: 1,
+                }],
+                ingested_at: now - 1990 + i * 30,
+            });
+        }
+        // 15 post-burst intervals back at 1.0 pct / 1M in
+        for i in 0..15 {
+            intervals.push(IntervalRecord {
+                id: 37 + i,
+                idempotency_key: format!("post-{i}"),
+                provider: "antigravity".to_string(),
+                tier: "pro".to_string(),
+                window_type: "gemini-5h".to_string(),
+                started_at: now - 1000 + i * 30,
+                ended_at: now - 990 + i * 30,
+                delta_pct: 1.0,
+                quota_precision: 0.01,
+                usage: vec![UsageEntry {
+                    model: "model-a".to_string(),
+                    tokens_in: 1_000_000,
+                    tokens_out: 0,
+                    tokens_cached_in: 0,
+                    request_count: 1,
+                }],
+                ingested_at: now - 990 + i * 30,
+            });
+        }
+
+        let snap = compute_partition_estimate(&key, &intervals, now, &config)
+            .expect("estimate should succeed");
+        assert!(
+            snap.sample_count_window >= 45,
+            "should recover full baseline window after transient burst, got {}",
+            snap.sample_count_window
+        );
+        let model_a = snap.models.iter().find(|m| m.model == "model-a").unwrap();
+        assert!(
+            (model_a.pct_per_1m_in - 1.0).abs() < 0.2,
+            "model-a rate should recover to ~1.0, got {}",
+            model_a.pct_per_1m_in
         );
     }
 }
