@@ -124,21 +124,31 @@ export function App() {
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [onlyResets, setOnlyResets] = useState(false);
 
+  const activeBucketIds = useMemo(() => {
+    if (!quotaStatus || quotaStatus.buckets.length === 0) return null;
+    return new Set(quotaStatus.buckets.map((b) => b.bucket_id.toLowerCase()));
+  }, [quotaStatus]);
+
+  const activePartitions = useMemo(() => {
+    if (!activeBucketIds) return partitions;
+    return partitions.filter((p) => activeBucketIds.has(p.window_type.toLowerCase()));
+  }, [partitions, activeBucketIds]);
+
   const tiersForProvider = useMemo(
     () =>
       Array.from(
         new Set(
-          partitions.filter((p) => p.provider === provider).map((p) => p.tier)
+          activePartitions.filter((p) => p.provider === provider).map((p) => p.tier)
         )
       ).sort(),
-    [partitions]
+    [activePartitions]
   );
 
   const bucketsForSelection = useMemo(
     () =>
       Array.from(
         new Set(
-          partitions
+          activePartitions
             .filter(
               (p) =>
                 p.provider === provider &&
@@ -147,7 +157,7 @@ export function App() {
             .map((p) => p.window_type)
         )
       ).sort(),
-    [partitions, tier]
+    [activePartitions, tier]
   );
 
   const refreshData = useCallback(async () => {
@@ -232,19 +242,33 @@ export function App() {
     return () => clearInterval(id);
   }, [refreshData]);
 
+  const activeHistory = useMemo(() => {
+    if (!activeBucketIds) return history;
+    return history.filter((h) => activeBucketIds.has(h.window_type.toLowerCase()));
+  }, [history, activeBucketIds]);
+
+  const activeQuotaHistory = useMemo(() => {
+    const list = quotaStatus?.history ?? [];
+    if (!activeBucketIds) return list;
+    return list.filter((h) => activeBucketIds.has(h.bucket_id.toLowerCase()));
+  }, [quotaStatus, activeBucketIds]);
+
   const modelRows: ModelTableRow[] = useMemo(
     () =>
-      windowsByTier.flatMap(({ tier: t, view }) =>
-        view.models.map((m) => ({
+      windowsByTier.flatMap(({ tier: t, view }) => {
+        if (activeBucketIds && !activeBucketIds.has(view.window_type.toLowerCase())) {
+          return [];
+        }
+        return view.models.map((m) => ({
           tier: t,
           windowType: view.window_type,
           mix: view.token_mix,
           pctPerUsd: view.pct_per_usd,
           bucketApiEquivUsd: view.bucket_api_equivalent_usd,
           model: m,
-        }))
-      ),
-    [windowsByTier]
+        }));
+      }),
+    [windowsByTier, activeBucketIds]
   );
 
   const uniqueModelNames = useMemo(() => {
@@ -285,10 +309,11 @@ export function App() {
   const recentChanges: QuotaChangeEvent[] = useMemo(() => {
     const list = quotaStatus?.changes ?? [];
     return [...list]
+      .filter((ev) => !activeBucketIds || activeBucketIds.has(ev.bucket_id.toLowerCase()))
       .filter((ev) => !onlyResets || ev.event_type === "reset")
       .reverse()
       .slice(0, 30);
-  }, [quotaStatus, onlyResets]);
+  }, [quotaStatus, onlyResets, activeBucketIds]);
 
   return (
     <div className="shell">
@@ -565,9 +590,9 @@ export function App() {
         </div>
       </section>
 
-      <QuotaBurndownChart history={quotaStatus?.history ?? []} />
+      <QuotaBurndownChart history={activeQuotaHistory} />
 
-      <TimelineChart points={history} metric={metric} onMetricChange={setMetric} />
+      <TimelineChart points={activeHistory} metric={metric} onMetricChange={setMetric} />
 
       <div className="grid-2">
         <ModelTable rows={modelRows} />
@@ -600,27 +625,92 @@ export function App() {
           </div>
         </div>
         {recentChanges.length === 0 ? (
-          <div className="empty">No quota changes recorded yet.</div>
+          <div className="panel-body">
+            <div className="empty-state">No quota changes recorded yet.</div>
+          </div>
         ) : (
-          <div className="events-list">
-            {recentChanges.map((ev) => (
-              <div className="event-item" key={ev.id}>
-                <span className="event-time">
-                  {new Date(ev.recorded_at * 1000).toLocaleString()}
-                </span>
-                <span className="event-desc">
-                  <strong>{ev.bucket_id}</strong> ({ev.event_type}):{" "}
-                  {ev.prev_pct !== null ? `${ev.prev_pct.toFixed(2)}% → ` : ""}
-                  {ev.curr_pct.toFixed(2)}%
-                  {ev.delta_pct !== null
-                    ? ` (${ev.delta_pct >= 0 ? "+" : ""}${ev.delta_pct.toFixed(2)}%)`
-                    : ""}
-                </span>
-                {ev.reset_time && (
-                  <span className="event-meta">reset {ev.reset_time}</span>
-                )}
-              </div>
-            ))}
+          <div className="table-wrap" style={{ maxHeight: 280, overflowY: "auto" }}>
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Bucket</th>
+                  <th>Type</th>
+                  <th>Change</th>
+                  <th>Delta</th>
+                  <th>Next Reset</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recentChanges.map((ev) => {
+                  const isReset = ev.event_type === "reset";
+                  const deltaStr =
+                    ev.delta_pct !== null
+                      ? `${ev.delta_pct >= 0 ? "+" : ""}${ev.delta_pct.toFixed(2)}%`
+                      : "--";
+                  const resetFormatted = ev.reset_time
+                    ? new Date(ev.reset_time).toLocaleString([], {
+                        month: "short",
+                        day: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })
+                    : "--";
+                  return (
+                    <tr key={ev.id}>
+                      <td className="mono" style={{ fontSize: 11, color: "var(--ink-muted)" }}>
+                        {new Date(ev.recorded_at * 1000).toLocaleString([], {
+                          month: "short",
+                          day: "numeric",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                          second: "2-digit",
+                        })}
+                      </td>
+                      <td className="mono" style={{ fontWeight: 600 }}>
+                        {ev.bucket_id}
+                      </td>
+                      <td>
+                        <span
+                          className="mono"
+                          style={{
+                            fontSize: 10,
+                            padding: "2px 6px",
+                            borderRadius: 3,
+                            background: isReset
+                              ? "rgba(21, 128, 61, 0.12)"
+                              : "var(--surface-muted)",
+                            color: isReset ? "var(--ok)" : "var(--ink-muted)",
+                            textTransform: "uppercase",
+                          }}
+                        >
+                          {ev.event_type}
+                        </span>
+                      </td>
+                      <td className="mono" style={{ fontSize: 12 }}>
+                        {ev.prev_pct !== null ? `${ev.prev_pct.toFixed(2)}% → ` : ""}
+                        <strong>{ev.curr_pct.toFixed(2)}%</strong>
+                      </td>
+                      <td
+                        className="mono"
+                        style={{
+                          fontSize: 12,
+                          color:
+                            ev.delta_pct !== null && ev.delta_pct > 0
+                              ? "var(--ok)"
+                              : "var(--ink)",
+                        }}
+                      >
+                        {deltaStr}
+                      </td>
+                      <td className="mono" style={{ fontSize: 11, color: "var(--ink-muted)" }}>
+                        {resetFormatted}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </section>

@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 pub const DEFAULT_WINDOW_LIMIT: usize = 1500;
 const HISTORY_ROLLING_WINDOW: usize = 50;
+const MIN_HISTORY_SAMPLES: usize = 10;
 
 #[derive(Debug, Clone, Default)]
 struct ModelAgg {
@@ -57,7 +58,8 @@ pub fn compute_partition_history(
 
     let n = intervals.len();
     let step = (n / max_points).max(1);
-    let mut sample_ends: Vec<usize> = (1..=n).step_by(step).collect();
+    let min_end = MIN_HISTORY_SAMPLES.min(n);
+    let mut sample_ends: Vec<usize> = (min_end..=n).step_by(step).collect();
     if sample_ends.last().copied() != Some(n) {
         sample_ends.push(n);
     }

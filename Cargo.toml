@@ -1,6 +1,6 @@
 [package]
 name = "cut-rs"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "Local Antigravity AI quota tracker, Waybar module, and on-demand cost estimator"
 license = "MIT"

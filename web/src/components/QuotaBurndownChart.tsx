@@ -28,34 +28,111 @@ function formatAxisTime(ts: number, spanSecs: number): string {
 
 export function QuotaBurndownChart({ history }: Props) {
   const [range, setRange] = useState<RangeFilter>("7d");
+  const [cleanBounces, setCleanBounces] = useState(true);
   const [hiddenBuckets, setHiddenBuckets] = useState<Record<string, boolean>>({});
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
   const filtered = useMemo(() => {
-    if (range === "all") return history;
-    const nowSec = Math.floor(Date.now() / 1000);
-    const cutoff = nowSec - (range === "24h" ? 86400 : 7 * 86400);
-    return history.filter((r) => r.recorded_at >= cutoff);
-  }, [history, range]);
+    const byRange = (() => {
+      if (range === "all") return history;
+      const nowSec = Math.floor(Date.now() / 1000);
+      const cutoff = nowSec - (range === "24h" ? 86400 : 7 * 86400);
+      return history.filter((r) => r.recorded_at >= cutoff);
+    })();
+    if (!cleanBounces) return byRange;
+
+    // Filter mid-window upward bounces/oscillations (same reset_time, remaining_pct increased)
+    const lastByBucket = new Map<string, QuotaSnapshotRow>();
+    const out: QuotaSnapshotRow[] = [];
+    for (const row of byRange) {
+      const prev = lastByBucket.get(row.bucket_id);
+      if (
+        prev &&
+        prev.reset_time === row.reset_time &&
+        row.remaining_pct > prev.remaining_pct + 1e-6
+      ) {
+        continue;
+      }
+      lastByBucket.set(row.bucket_id, row);
+      out.push(row);
+    }
+    return out;
+  }, [history, range, cleanBounces]);
 
   const { buckets, timestamps, minTs, maxTs } = useMemo(() => {
-    const byBucket = new Map<string, { ts: number; val: number }[]>();
+    const byBucket = new Map<string, QuotaSnapshotRow[]>();
     const tsSet = new Set<number>();
 
     for (const row of filtered) {
       tsSet.add(row.recorded_at);
-      let pts = byBucket.get(row.bucket_id);
-      if (!pts) {
-        pts = [];
-        byBucket.set(row.bucket_id, pts);
+      let list = byBucket.get(row.bucket_id);
+      if (!list) {
+        list = [];
+        byBucket.set(row.bucket_id, list);
       }
-      pts.push({ ts: row.recorded_at, val: row.remaining_pct });
+      list.push(row);
     }
 
     const sortedTs = Array.from(tsSet).sort((a, b) => a - b);
     const bucketList = Array.from(byBucket.entries())
-      .map(([bucketId, pts], idx) => {
-        pts.sort((a, b) => a.ts - b.ts);
+      .map(([bucketId, rows], idx) => {
+        rows.sort((a, b) => a.recorded_at - b.recorded_at || a.id - b.id);
+        const lowerId = bucketId.toLowerCase();
+        const windowSec =
+          lowerId.includes("weekly") || lowerId.includes("week")
+            ? 7 * 86400
+            : lowerId.includes("5h")
+            ? 5 * 3600
+            : 0;
+
+        const pts: { ts: number; val: number; synthetic?: boolean }[] = [];
+        for (let i = 0; i < rows.length; i++) {
+          const curr = rows[i];
+          if (i > 0) {
+            const prev = rows[i - 1];
+            if (prev.reset_time !== curr.reset_time) {
+              const prevResetMs = prev.reset_time ? Date.parse(prev.reset_time) : NaN;
+              const currResetMs = curr.reset_time ? Date.parse(curr.reset_time) : NaN;
+              const prevResetTs = Number.isFinite(prevResetMs)
+                ? Math.floor(prevResetMs / 1000)
+                : null;
+              const currStartTs =
+                Number.isFinite(currResetMs) && windowSec > 0
+                  ? Math.floor(currResetMs / 1000) - windowSec
+                  : null;
+
+              let resetAt: number | null = null;
+              if (
+                prevResetTs !== null &&
+                prevResetTs > prev.recorded_at &&
+                prevResetTs < curr.recorded_at
+              ) {
+                pts.push({ ts: prevResetTs, val: prev.remaining_pct, synthetic: true });
+                pts.push({ ts: prevResetTs, val: 100.0, synthetic: true });
+                resetAt = prevResetTs;
+              } else if (
+                currStartTs !== null &&
+                currStartTs > prev.recorded_at &&
+                currStartTs < curr.recorded_at
+              ) {
+                pts.push({ ts: currStartTs, val: prev.remaining_pct, synthetic: true });
+                pts.push({ ts: currStartTs, val: 100.0, synthetic: true });
+                resetAt = currStartTs;
+              }
+
+              if (
+                currStartTs !== null &&
+                resetAt !== null &&
+                currStartTs > resetAt &&
+                currStartTs < curr.recorded_at
+              ) {
+                pts.push({ ts: currStartTs, val: 100.0, synthetic: true });
+              }
+            }
+          }
+          pts.push({ ts: curr.recorded_at, val: curr.remaining_pct });
+        }
+
         return {
           bucketId,
           pts,
@@ -99,6 +176,14 @@ export function QuotaBurndownChart({ history }: Props) {
       <div className="panel-head">
         <span className="panel-title">Quota Burn-Down History (% remaining)</span>
         <div className="controls">
+          <button
+            type="button"
+            className={`btn btn-sm ${cleanBounces ? "active" : ""}`}
+            onClick={() => setCleanBounces(!cleanBounces)}
+            title="Hide mid-window stale-read bounces"
+          >
+            {cleanBounces ? "Clean" : "Raw"}
+          </button>
           {(["24h", "7d", "all"] as RangeFilter[]).map((r) => (
             <button
               key={r}
@@ -202,15 +287,18 @@ export function QuotaBurndownChart({ history }: Props) {
                         strokeLinejoin="round"
                       />
                     )}
-                    {b.pts.map((pt, idx) => (
-                      <circle
-                        key={idx}
-                        cx={xOf(pt.ts)}
-                        cy={yOf(pt.val)}
-                        r={b.pts.length === 1 ? 4 : 2.5}
-                        fill={b.color}
-                      />
-                    ))}
+                    {b.pts.map(
+                      (pt, idx) =>
+                        !pt.synthetic && (
+                          <circle
+                            key={idx}
+                            cx={xOf(pt.ts)}
+                            cy={yOf(pt.val)}
+                            r={b.pts.length === 1 ? 4 : 2.5}
+                            fill={b.color}
+                          />
+                        )
+                    )}
                   </g>
                 );
               })}
@@ -242,7 +330,14 @@ export function QuotaBurndownChart({ history }: Props) {
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
                 {buckets.map((b) => {
                   const hidden = !!hiddenBuckets[b.bucketId];
-                  const latest = b.pts[b.pts.length - 1];
+                  let displayPt = b.pts[b.pts.length - 1];
+                  if (hoverTs !== null) {
+                    let match: (typeof b.pts)[number] | undefined;
+                    for (const pt of b.pts) {
+                      if (pt.ts <= hoverTs) match = pt;
+                    }
+                    if (match) displayPt = match;
+                  }
                   return (
                     <button
                       key={b.bucketId}
@@ -266,9 +361,9 @@ export function QuotaBurndownChart({ history }: Props) {
                         }}
                       />
                       <span>{b.bucketId}</span>
-                      {latest && (
-                        <span style={{ opacity: 0.7 }}>
-                          {latest.val.toFixed(1)}%
+                      {displayPt && (
+                        <span className="mono" style={{ fontWeight: 600 }}>
+                          {displayPt.val.toFixed(1)}%
                         </span>
                       )}
                     </button>
@@ -276,23 +371,11 @@ export function QuotaBurndownChart({ history }: Props) {
                 })}
               </div>
 
-              {hoverTs !== null && (
-                <div style={{ opacity: 0.8 }}>
-                  <strong>{new Date(hoverTs * 1000).toLocaleString()}</strong>
-                  {visibleBuckets.map((b) => {
-                    let match: { ts: number; val: number } | undefined;
-                    for (const pt of b.pts) {
-                      if (pt.ts <= hoverTs) match = pt;
-                    }
-                    if (!match) return null;
-                    return (
-                      <span key={b.bucketId} style={{ marginLeft: 10 }}>
-                        {b.bucketId}: {match.val.toFixed(1)}%
-                      </span>
-                    );
-                  })}
-                </div>
-              )}
+              <span className="mono" style={{ fontSize: 11, color: "var(--ink-muted)" }}>
+                {hoverTs !== null
+                  ? new Date(hoverTs * 1000).toLocaleString()
+                  : "Latest"}
+              </span>
             </div>
           </>
         )}
