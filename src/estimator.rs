@@ -1,11 +1,35 @@
 use crate::config::Config;
-use crate::math::changepoint::{RECENT_TAIL, W_LONG, evaluate_changepoint};
-use crate::math::irls::fit_irls_nnls;
 use crate::models::{
-    ChangeEvent, ChangeEventType, ConfidenceInterval, Identifiability, IntervalRecord, ModelStatus,
-    ModelWeightEstimate, PartitionKey, SnapshotPayload,
+    IntervalRecord, ModelStatus, ModelWeightEstimate, PartitionKey, SnapshotPayload, TokenMix,
+    UsageEntry, normalize_key,
 };
-use std::collections::{HashMap, HashSet};
+use crate::pricing::{lookup_model_pricing, usage_api_cost_usd};
+use std::collections::BTreeMap;
+
+pub const DEFAULT_WINDOW_LIMIT: usize = 1500;
+const HISTORY_ROLLING_WINDOW: usize = 50;
+
+#[derive(Debug, Clone, Default)]
+struct ModelAgg {
+    tokens_in: u64,
+    tokens_out: u64,
+    tokens_cached_in: u64,
+    requests: u64,
+    api_usd: f64,
+    sample_count: usize,
+    last_seen_at: i64,
+    unpriced_delta_pct: f64,
+    unpriced_blended_tokens: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PredictionResult {
+    pub expected_delta_pct: f64,
+    pub expected_api_usd: f64,
+    pub ci_95_lower: f64,
+    pub ci_95_upper: f64,
+    pub pct_per_usd: f64,
+}
 
 pub fn compute_partition_estimate(
     key: &PartitionKey,
@@ -13,7 +37,11 @@ pub fn compute_partition_estimate(
     now: i64,
     config: &Config,
 ) -> Option<SnapshotPayload> {
-    compute_partition_history(key, intervals, now, config, 40).pop()
+    if intervals.is_empty() {
+        return None;
+    }
+    let cal_start = intervals.len().saturating_sub(HISTORY_ROLLING_WINDOW);
+    Some(build_snapshot(key, intervals, &intervals[cal_start..], now, config))
 }
 
 pub fn compute_partition_history(
@@ -35,399 +63,280 @@ pub fn compute_partition_history(
     }
 
     let mut out = Vec::with_capacity(sample_ends.len());
-    let mut regime_start_idx = 0usize;
-    let mut pre_regime_rate: Option<f64> = None;
-    let mut prev_status: Option<HashMap<String, ModelStatus>> = None;
-    let mut last_known_estimates: HashMap<String, ModelWeightEstimate> = HashMap::new();
-    let mut events: Vec<ChangeEvent> = vec![ChangeEvent {
-        timestamp: intervals[0].ingested_at,
-        event_type: ChangeEventType::BucketAdded,
-        description: format!("Discovered quota bucket '{}'", key.window_type),
-        cusum_value: None,
-        p_value: None,
-    }];
-
     for end in sample_ends {
-        let long_start = end.saturating_sub(W_LONG);
-
-        // If a previous regime_changed was triggered by a transient burst and the most recent
-        // RECENT_TAIL samples have reverted to the pre-regime rate, recover the full window.
-        if regime_start_idx > long_start
-            && end >= regime_start_idx + RECENT_TAIL * 2
-            && let Some(base_rate) = pre_regime_rate
-        {
-            let tail_rates: Vec<f64> = intervals[end - RECENT_TAIL..end]
-                .iter()
-                .filter_map(|iv| {
-                    let tot: u64 = iv
-                        .usage
-                        .iter()
-                        .map(|u| u.tokens_in + u.tokens_out + u.tokens_cached_in)
-                        .sum();
-                    if tot > 0 {
-                        Some(iv.delta_pct / (tot as f64 / 1_000_000.0))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if tail_rates.len() >= RECENT_TAIL / 2 {
-                let mut sorted = tail_rates;
-                sorted.sort_by(|a, b| a.total_cmp(b));
-                let med_tail = sorted[sorted.len() / 2];
-                if (med_tail - base_rate).abs() <= base_rate.abs() * 0.5 + 0.5 {
-                    regime_start_idx = long_start;
-                    pre_regime_rate = None;
-                }
-            }
-        }
-
-        let win_start = regime_start_idx.max(long_start);
-        let window = &intervals[win_start..end];
-        if window.is_empty() {
-            continue;
-        }
-
+        let start = end.saturating_sub(HISTORY_ROLLING_WINDOW);
+        let window = &intervals[start..end];
         let point_ts = if end == n {
             now
         } else {
             window.last().map(|iv| iv.ingested_at).unwrap_or(now)
         };
-
-        let Some(fit) = fit_irls_nnls(window, point_ts, config.model_stale_days) else {
-            continue;
-        };
-
-        let cp = evaluate_changepoint(
-            window,
-            &fit.residuals,
-            fit.sigma_hat,
-            0.0,
-            0.0,
-            point_ts,
-        );
-
-        let stale_cutoff = point_ts - config.model_stale_days * 86_400;
-
-        // Track all models seen across the W_LONG window so a regime reset does not
-        // falsely retire or hide active models that haven't been used in the new tail yet.
-        let mut long_last_seen: HashMap<String, i64> = HashMap::new();
-        for iv in &intervals[long_start..end] {
-            for u in &iv.usage {
-                let m = u.model.trim().to_ascii_lowercase();
-                if m.is_empty() {
-                    continue;
-                }
-                let entry = long_last_seen.entry(m).or_insert(0);
-                if iv.ended_at > *entry {
-                    *entry = iv.ended_at;
-                }
-            }
-        }
-
-        let mut models = fit.models;
-        for m in &models {
-            last_known_estimates.insert(m.model.clone(), m.clone());
-        }
-        let fitted_names: HashSet<String> = models.iter().map(|m| m.model.clone()).collect();
-        for (m_name, last_seen_at) in &long_last_seen {
-            if fitted_names.contains(m_name) {
-                continue;
-            }
-            let status = if *last_seen_at < stale_cutoff {
-                ModelStatus::Retired
-            } else {
-                ModelStatus::Active
-            };
-            if let Some(prev) = last_known_estimates.get(m_name) {
-                let mut carried = prev.clone();
-                carried.last_seen_at = *last_seen_at;
-                carried.status = status;
-                carried.identifiability = Identifiability::InsufficientSamples;
-                models.push(carried);
-            } else {
-                models.push(ModelWeightEstimate {
-                    model: m_name.clone(),
-                    pct_per_1m_in: 0.0,
-                    pct_per_1m_in_ci: ConfidenceInterval {
-                        lower: 0.0,
-                        upper: 0.0,
-                    },
-                    pct_per_1m_out: 0.0,
-                    pct_per_1m_out_ci: ConfidenceInterval {
-                        lower: 0.0,
-                        upper: 0.0,
-                    },
-                    pct_per_1m_cached_in: 0.0,
-                    pct_per_1m_cached_in_ci: ConfidenceInterval {
-                        lower: 0.0,
-                        upper: 0.0,
-                    },
-                    identifiability: Identifiability::InsufficientSamples,
-                    sample_count: 0,
-                    last_seen_at: *last_seen_at,
-                    status,
-                    token_mix: None,
-                });
-            }
-        }
-        models.sort_by(|a, b| a.model.cmp(&b.model));
-
-        let curr_status: HashMap<String, ModelStatus> = models
-            .iter()
-            .map(|m| (m.model.clone(), m.status))
-            .collect();
-
-        if let Some(prev) = &prev_status {
-            for (m, &status) in &curr_status {
-                match prev.get(m) {
-                    None if status == ModelStatus::Active => {
-                        events.push(ChangeEvent {
-                            timestamp: point_ts,
-                            event_type: ChangeEventType::ModelAdded,
-                            description: format!("Model '{m}' added to bucket '{}'", key.window_type),
-                            cusum_value: None,
-                            p_value: None,
-                        });
-                    }
-                    Some(ModelStatus::Retired) if status == ModelStatus::Active => {
-                        events.push(ChangeEvent {
-                            timestamp: point_ts,
-                            event_type: ChangeEventType::ModelAdded,
-                            description: format!("Model '{m}' added to bucket '{}'", key.window_type),
-                            cusum_value: None,
-                            p_value: None,
-                        });
-                    }
-                    Some(ModelStatus::Active) if status == ModelStatus::Retired => {
-                        events.push(ChangeEvent {
-                            timestamp: point_ts,
-                            event_type: ChangeEventType::ModelRetired,
-                            description: format!(
-                                "Model '{m}' retired from bucket '{}'",
-                                key.window_type
-                            ),
-                            cusum_value: None,
-                            p_value: None,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-        prev_status = Some(curr_status);
-
-        if let Some(ev) = cp.event {
-            events.push(ev);
-        }
-        if cp.regime_changed {
-            let mut base_rates: Vec<f64> = window[..window.len().saturating_sub(RECENT_TAIL)]
-                .iter()
-                .filter_map(|iv| {
-                    let tot: u64 = iv
-                        .usage
-                        .iter()
-                        .map(|u| u.tokens_in + u.tokens_out + u.tokens_cached_in)
-                        .sum();
-                    if tot > 0 {
-                        Some(iv.delta_pct / (tot as f64 / 1_000_000.0))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !base_rates.is_empty() {
-                base_rates.sort_by(|a, b| a.total_cmp(b));
-                pre_regime_rate = Some(base_rates[base_rates.len() / 2]);
-            }
-            regime_start_idx = end.saturating_sub(RECENT_TAIL);
-        }
-
-        if events.len() > 20 {
-            let excess = events.len() - 20;
-            events.drain(0..excess);
-        }
-
-        let last_ingested = window.last().map(|iv| iv.ingested_at).unwrap_or(point_ts);
-        let stale = point_ts - last_ingested > config.bucket_stale_days * 86_400;
-        let regime_since = window.first().map(|iv| iv.ingested_at).unwrap_or(0);
-
-        out.push(SnapshotPayload {
-            provider: key.provider.clone(),
-            tier: key.tier.clone(),
-            window_type: key.window_type.clone(),
-            computed_at: point_ts,
-            regime_since,
-            sample_count_window: window.len(),
-            sigma_hat: fit.sigma_hat,
-            stale,
-            token_mix: fit.token_mix,
-            models,
-            recent_change_events: events.clone(),
-        });
+        out.push(build_snapshot(key, window, window, point_ts, config));
     }
 
     out
 }
 
+pub fn predict_usage(
+    snap: &SnapshotPayload,
+    usage: &[UsageEntry],
+) -> PredictionResult {
+    let (priced_usd, _) = usage_api_cost_usd(usage);
+    let mut expected_delta = priced_usd * snap.pct_per_usd;
+
+    // Fallback for any unpriced models in the prediction request
+    for u in usage {
+        if lookup_model_pricing(&u.model).is_none() {
+            let m_norm = normalize_key(&u.model);
+            if let Some(m) = snap.models.iter().find(|m| m.model == m_norm) {
+                expected_delta += (u.tokens_in as f64 * m.pct_per_1m_in
+                    + u.tokens_out as f64 * m.pct_per_1m_out
+                    + u.tokens_cached_in as f64 * m.pct_per_1m_cached_in)
+                    / 1_000_000.0;
+            }
+        }
+    }
+
+    let lower = if snap.pct_per_usd > 0.0 && snap.pct_per_usd_p25 > 0.0 {
+        expected_delta * (snap.pct_per_usd_p25 / snap.pct_per_usd)
+    } else {
+        expected_delta * 0.85
+    };
+    let upper = if snap.pct_per_usd > 0.0 && snap.pct_per_usd_p75 > 0.0 {
+        expected_delta * (snap.pct_per_usd_p75 / snap.pct_per_usd)
+    } else {
+        expected_delta * 1.15
+    };
+
+    PredictionResult {
+        expected_delta_pct: expected_delta.max(0.0),
+        expected_api_usd: priced_usd.max(0.0),
+        ci_95_lower: lower.min(expected_delta).max(0.0),
+        ci_95_upper: upper.max(expected_delta),
+        pct_per_usd: snap.pct_per_usd,
+    }
+}
+
+fn build_snapshot(
+    key: &PartitionKey,
+    window: &[IntervalRecord],
+    calibration_window: &[IntervalRecord],
+    point_ts: i64,
+    config: &Config,
+) -> SnapshotPayload {
+    let mut total_in: u64 = 0;
+    let mut total_out: u64 = 0;
+    let mut total_cached: u64 = 0;
+    let mut total_delta_pct: f64 = 0.0;
+    let mut total_api_usd: f64 = 0.0;
+
+    let mut ratios: Vec<f64> = Vec::new();
+    for iv in calibration_window {
+        let (iv_usd, all_priced) = usage_api_cost_usd(&iv.usage);
+        if all_priced && iv_usd > 1e-9 && iv.delta_pct > 0.0 {
+            ratios.push(iv.delta_pct / iv_usd);
+        }
+    }
+
+    let mut model_aggs: BTreeMap<String, ModelAgg> = BTreeMap::new();
+
+    for iv in window {
+        total_delta_pct += iv.delta_pct.max(0.0);
+        let (iv_usd, _) = usage_api_cost_usd(&iv.usage);
+        total_api_usd += iv_usd;
+
+        let mut seen_in_iv = std::collections::HashSet::new();
+        for u in &iv.usage {
+            let m = normalize_key(&u.model);
+            if m.is_empty() {
+                continue;
+            }
+            total_in += u.tokens_in;
+            total_out += u.tokens_out;
+            total_cached += u.tokens_cached_in;
+
+            let agg = model_aggs.entry(m.clone()).or_default();
+            agg.tokens_in += u.tokens_in;
+            agg.tokens_out += u.tokens_out;
+            agg.tokens_cached_in += u.tokens_cached_in;
+            agg.requests += u.request_count as u64;
+            if seen_in_iv.insert(m) {
+                agg.sample_count += 1;
+            }
+            if iv.ended_at > agg.last_seen_at {
+                agg.last_seen_at = iv.ended_at;
+            }
+            if let Some(p) = lookup_model_pricing(&u.model) {
+                agg.api_usd += p.cost_usd(u.tokens_in, u.tokens_out, u.tokens_cached_in);
+            } else if iv.usage.len() == 1 && iv.delta_pct > 0.0 {
+                let blended = u.tokens_in as f64
+                    + 5.0 * u.tokens_out as f64
+                    + 0.05 * u.tokens_cached_in as f64;
+                if blended > 0.0 {
+                    agg.unpriced_delta_pct += iv.delta_pct;
+                    agg.unpriced_blended_tokens += blended;
+                }
+            }
+        }
+    }
+
+    ratios.sort_by(|a, b| a.total_cmp(b));
+    let (pct_per_usd, pct_per_usd_p25, pct_per_usd_p75) = if ratios.is_empty() {
+        (0.0, 0.0, 0.0)
+    } else {
+        let med = ratios[ratios.len() / 2];
+        let p25 = ratios[(ratios.len() - 1) / 4];
+        let p75 = ratios[((ratios.len() - 1) * 3) / 4];
+        (med, p25, p75)
+    };
+    let bucket_api_equivalent_usd = if pct_per_usd > 1e-9 {
+        100.0 / pct_per_usd
+    } else {
+        0.0
+    };
+
+    let grand_tokens = (total_in + total_out + total_cached) as f64;
+    let token_mix = if grand_tokens > 0.0 {
+        TokenMix {
+            in_share: total_in as f64 / grand_tokens,
+            out_share: total_out as f64 / grand_tokens,
+            cached_share: total_cached as f64 / grand_tokens,
+        }
+    } else {
+        TokenMix::default()
+    };
+
+    let stale_cutoff = point_ts - config.model_stale_days * 86_400;
+    let models = model_aggs
+        .into_iter()
+        .map(|(model, agg)| {
+            let status = if agg.last_seen_at < stale_cutoff {
+                ModelStatus::Retired
+            } else {
+                ModelStatus::Active
+            };
+            if let Some(p) = lookup_model_pricing(&model) {
+                ModelWeightEstimate {
+                    model,
+                    priced: true,
+                    usd_per_1m_in: p.usd_per_1m_in,
+                    usd_per_1m_out: p.usd_per_1m_out,
+                    usd_per_1m_cached_in: p.usd_per_1m_cached_in,
+                    pct_per_1m_in: p.usd_per_1m_in * pct_per_usd,
+                    pct_per_1m_out: p.usd_per_1m_out * pct_per_usd,
+                    pct_per_1m_cached_in: p.usd_per_1m_cached_in * pct_per_usd,
+                    total_tokens_in: agg.tokens_in,
+                    total_tokens_out: agg.tokens_out,
+                    total_tokens_cached_in: agg.tokens_cached_in,
+                    total_requests: agg.requests,
+                    total_api_usd: agg.api_usd,
+                    sample_count: agg.sample_count,
+                    last_seen_at: agg.last_seen_at,
+                    status,
+                }
+            } else {
+                let base_in = if agg.unpriced_blended_tokens > 0.0 {
+                    agg.unpriced_delta_pct / (agg.unpriced_blended_tokens / 1_000_000.0)
+                } else {
+                    0.0
+                };
+                ModelWeightEstimate {
+                    model,
+                    priced: false,
+                    usd_per_1m_in: 0.0,
+                    usd_per_1m_out: 0.0,
+                    usd_per_1m_cached_in: 0.0,
+                    pct_per_1m_in: base_in,
+                    pct_per_1m_out: base_in * 5.0,
+                    pct_per_1m_cached_in: base_in * 0.05,
+                    total_tokens_in: agg.tokens_in,
+                    total_tokens_out: agg.tokens_out,
+                    total_tokens_cached_in: agg.tokens_cached_in,
+                    total_requests: agg.requests,
+                    total_api_usd: 0.0,
+                    sample_count: agg.sample_count,
+                    last_seen_at: agg.last_seen_at,
+                    status,
+                }
+            }
+        })
+        .collect();
+
+    let last_ingested = window.last().map(|iv| iv.ingested_at).unwrap_or(point_ts);
+    let stale = point_ts - last_ingested > config.bucket_stale_days * 86_400;
+
+    SnapshotPayload {
+        provider: key.provider.clone(),
+        tier: key.tier.clone(),
+        window_type: key.window_type.clone(),
+        computed_at: point_ts,
+        sample_count_window: window.len(),
+        stale,
+        pct_per_usd,
+        bucket_api_equivalent_usd,
+        pct_per_usd_p25,
+        pct_per_usd_p75,
+        total_api_usd,
+        total_delta_pct,
+        token_mix,
+        models,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::UsageEntry;
 
     #[test]
-    fn test_regime_change_does_not_retire_active_models() {
+    fn test_bucket_api_equivalent_and_prediction() {
         let now = 1_795_210_000;
-        let key = PartitionKey::new("antigravity", "pro", "gemini-5h");
+        let key = PartitionKey::new("antigravity", "google ai pro", "gemini-5h");
         let config = Config::test_default("sqlite::memory:".to_string(), "/tmp/s.json".into());
 
-        let mut intervals = Vec::new();
-        for i in 0..30 {
-            intervals.push(IntervalRecord {
-                id: i + 1,
-                idempotency_key: format!("a-{i}"),
-                provider: "antigravity".to_string(),
-                tier: "pro".to_string(),
-                window_type: "gemini-5h".to_string(),
-                started_at: now - 3600 + i * 30,
-                ended_at: now - 3590 + i * 30,
-                delta_pct: 1.0,
-                quota_precision: 0.01,
-                usage: vec![UsageEntry {
-                    model: "model-a".to_string(),
-                    tokens_in: 1_000_000,
-                    tokens_out: 0,
-                    tokens_cached_in: 0,
-                    request_count: 1,
-                }],
-                ingested_at: now - 3590 + i * 30,
-            });
-        }
-        for i in 0..10 {
-            intervals.push(IntervalRecord {
-                id: 31 + i,
-                idempotency_key: format!("b-{i}"),
-                provider: "antigravity".to_string(),
-                tier: "pro".to_string(),
-                window_type: "gemini-5h".to_string(),
-                started_at: now - 600 + i * 30,
-                ended_at: now - 590 + i * 30,
-                delta_pct: 5.0,
-                quota_precision: 0.01,
-                usage: vec![UsageEntry {
-                    model: "model-b".to_string(),
-                    tokens_in: 1_000_000,
-                    tokens_out: 0,
-                    tokens_cached_in: 0,
-                    request_count: 1,
-                }],
-                ingested_at: now - 590 + i * 30,
-            });
-        }
+        // Hydrogen: $1.5 / $7.5 / $0.075 per 1M.
+        // 1M in ($1.50) + 0 out + 0 cached = $1.50 API cost.
+        // If delta_pct = 15.0%, then pct_per_usd = 10.0%/USD and bucket_api_equivalent_usd = $10.00.
+        let intervals = vec![IntervalRecord {
+            id: 1,
+            idempotency_key: "h-1".to_string(),
+            provider: "antigravity".to_string(),
+            tier: "google ai pro".to_string(),
+            window_type: "gemini-5h".to_string(),
+            started_at: now - 120,
+            ended_at: now - 60,
+            delta_pct: 15.0,
+            quota_precision: 0.01,
+            usage: vec![UsageEntry {
+                model: "gemini 4 hydrogen (medium)".to_string(),
+                tokens_in: 1_000_000,
+                tokens_out: 0,
+                tokens_cached_in: 0,
+                request_count: 1,
+            }],
+            ingested_at: now - 60,
+        }];
 
-        let snap = compute_partition_estimate(&key, &intervals, now, &config)
-            .expect("estimate should succeed");
-        let model_a = snap
-            .models
-            .iter()
-            .find(|m| m.model == "model-a")
-            .expect("model-a should remain present after regime change");
-        assert_eq!(model_a.status, ModelStatus::Active);
-        assert!(
-            !snap
-                .recent_change_events
-                .iter()
-                .any(|e| e.event_type == ChangeEventType::ModelRetired),
-            "non-stale model-a should not emit ModelRetired"
+        let snap = compute_partition_estimate(&key, &intervals, now, &config).unwrap();
+        assert!((snap.pct_per_usd - 10.0).abs() < 1e-6);
+        assert!((snap.bucket_api_equivalent_usd - 10.0).abs() < 1e-6);
+
+        let m = &snap.models[0];
+        assert!(m.priced);
+        assert!((m.pct_per_1m_in - 15.0).abs() < 1e-6);
+        assert!((m.pct_per_1m_out - 75.0).abs() < 1e-6);
+        assert!((m.pct_per_1m_cached_in - 0.75).abs() < 1e-6);
+
+        let pred = predict_usage(
+            &snap,
+            &[UsageEntry {
+                model: "gemini 4 neon (high)".to_string(),
+                tokens_in: 1_000_000, // $3.00 -> 30.0%
+                tokens_out: 0,
+                tokens_cached_in: 0,
+                request_count: 1,
+            }],
         );
-    }
-
-    #[test]
-    fn test_transient_spike_burst_recovers_baseline_window() {
-        let now = 1_795_210_000;
-        let key = PartitionKey::new("antigravity", "pro", "gemini-5h");
-        let config = Config::test_default("sqlite::memory:".to_string(), "/tmp/s.json".into());
-
-        let mut intervals = Vec::new();
-        // 30 baseline intervals at 1.0 pct / 1M in
-        for i in 0..30 {
-            intervals.push(IntervalRecord {
-                id: i + 1,
-                idempotency_key: format!("base-{i}"),
-                provider: "antigravity".to_string(),
-                tier: "pro".to_string(),
-                window_type: "gemini-5h".to_string(),
-                started_at: now - 5000 + i * 30,
-                ended_at: now - 4990 + i * 30,
-                delta_pct: 1.0,
-                quota_precision: 0.01,
-                usage: vec![UsageEntry {
-                    model: "model-a".to_string(),
-                    tokens_in: 1_000_000,
-                    tokens_out: 0,
-                    tokens_cached_in: 0,
-                    request_count: 1,
-                }],
-                ingested_at: now - 4990 + i * 30,
-            });
-        }
-        // 6 transient spike intervals at 10.0 pct / 1M in
-        for i in 0..6 {
-            intervals.push(IntervalRecord {
-                id: 31 + i,
-                idempotency_key: format!("burst-{i}"),
-                provider: "antigravity".to_string(),
-                tier: "pro".to_string(),
-                window_type: "gemini-5h".to_string(),
-                started_at: now - 2000 + i * 30,
-                ended_at: now - 1990 + i * 30,
-                delta_pct: 10.0,
-                quota_precision: 0.01,
-                usage: vec![UsageEntry {
-                    model: "model-b".to_string(),
-                    tokens_in: 1_000_000,
-                    tokens_out: 0,
-                    tokens_cached_in: 0,
-                    request_count: 1,
-                }],
-                ingested_at: now - 1990 + i * 30,
-            });
-        }
-        // 15 post-burst intervals back at 1.0 pct / 1M in
-        for i in 0..15 {
-            intervals.push(IntervalRecord {
-                id: 37 + i,
-                idempotency_key: format!("post-{i}"),
-                provider: "antigravity".to_string(),
-                tier: "pro".to_string(),
-                window_type: "gemini-5h".to_string(),
-                started_at: now - 1000 + i * 30,
-                ended_at: now - 990 + i * 30,
-                delta_pct: 1.0,
-                quota_precision: 0.01,
-                usage: vec![UsageEntry {
-                    model: "model-a".to_string(),
-                    tokens_in: 1_000_000,
-                    tokens_out: 0,
-                    tokens_cached_in: 0,
-                    request_count: 1,
-                }],
-                ingested_at: now - 990 + i * 30,
-            });
-        }
-
-        let snap = compute_partition_estimate(&key, &intervals, now, &config)
-            .expect("estimate should succeed");
-        assert!(
-            snap.sample_count_window >= 45,
-            "should recover full baseline window after transient burst, got {}",
-            snap.sample_count_window
-        );
-        let model_a = snap.models.iter().find(|m| m.model == "model-a").unwrap();
-        assert!(
-            (model_a.pct_per_1m_in - 1.0).abs() < 0.2,
-            "model-a rate should recover to ~1.0, got {}",
-            model_a.pct_per_1m_in
-        );
+        assert!((pred.expected_api_usd - 3.0).abs() < 1e-6);
+        assert!((pred.expected_delta_pct - 30.0).abs() < 1e-6);
     }
 }

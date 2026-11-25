@@ -1,6 +1,9 @@
 use crate::db::{NewInterval, TelemetryRepository};
 use crate::error::AppError;
-use crate::models::{IntervalRecord, PartitionKey, QuotaSnapshotRow, UsageEntry};
+use crate::models::{
+    IntervalRecord, ModelUsageSummary, PartitionKey, QuotaChangeEvent, QuotaChangeType,
+    QuotaSnapshotRow, UsageEntry,
+};
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
@@ -214,5 +217,207 @@ impl TelemetryRepository for SqliteRepository {
             .collect();
         out.reverse();
         Ok(out)
+    }
+
+    async fn fetch_quota_changes(
+        &self,
+        bucket_id: Option<&str>,
+        include_anomalies: bool,
+        limit: usize,
+    ) -> Result<Vec<QuotaChangeEvent>, AppError> {
+        let rows = sqlx::query(
+            r#"
+            WITH ordered AS (
+                SELECT
+                    id,
+                    tier,
+                    bucket_id,
+                    recorded_at,
+                    remaining_pct,
+                    reset_time,
+                    LAG(remaining_pct) OVER (PARTITION BY tier, bucket_id ORDER BY recorded_at, id) AS prev_pct,
+                    LAG(reset_time) OVER (PARTITION BY tier, bucket_id ORDER BY recorded_at, id) AS prev_reset
+                FROM quota_snapshots
+                WHERE (?1 IS NULL OR bucket_id = ?1)
+            ),
+            classified AS (
+                SELECT
+                    id,
+                    tier,
+                    bucket_id,
+                    recorded_at,
+                    prev_pct,
+                    remaining_pct AS curr_pct,
+                    CASE WHEN prev_pct IS NULL THEN NULL ELSE remaining_pct - prev_pct END AS delta_pct,
+                    reset_time,
+                    CASE
+                        WHEN prev_pct IS NULL THEN 'init'
+                        WHEN reset_time IS NOT prev_reset THEN 'reset'
+                        WHEN remaining_pct < prev_pct - 1e-6 THEN 'decrease'
+                        WHEN remaining_pct > prev_pct + 1e-6 THEN 'anomaly_increase'
+                        ELSE 'unchanged'
+                    END AS event_type
+                FROM ordered
+            )
+            SELECT id, tier, bucket_id, recorded_at, prev_pct, curr_pct, delta_pct, reset_time, event_type
+            FROM classified
+            WHERE event_type != 'unchanged'
+              AND (?2 = 1 OR event_type != 'anomaly_increase')
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT ?3
+            "#,
+        )
+        .bind(bucket_id)
+        .bind(if include_anomalies { 1_i64 } else { 0_i64 })
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out: Vec<QuotaChangeEvent> = rows
+            .into_iter()
+            .filter_map(|r| {
+                let et_str: String = r.get("event_type");
+                let event_type = match et_str.as_str() {
+                    "init" => QuotaChangeType::Init,
+                    "reset" => QuotaChangeType::Reset,
+                    "decrease" => QuotaChangeType::Decrease,
+                    "anomaly_increase" => QuotaChangeType::AnomalyIncrease,
+                    _ => return None,
+                };
+                Some(QuotaChangeEvent {
+                    id: r.get("id"),
+                    tier: r.get("tier"),
+                    bucket_id: r.get("bucket_id"),
+                    recorded_at: r.get("recorded_at"),
+                    prev_pct: r.get("prev_pct"),
+                    curr_pct: r.get("curr_pct"),
+                    delta_pct: r.get("delta_pct"),
+                    reset_time: r.get("reset_time"),
+                    event_type,
+                })
+            })
+            .collect();
+        out.reverse();
+        Ok(out)
+    }
+
+    async fn fetch_usage_by_model(
+        &self,
+        tier: Option<&str>,
+        window_type: Option<&str>,
+        since_ts: i64,
+    ) -> Result<Vec<ModelUsageSummary>, AppError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                i.tier,
+                i.window_type,
+                LOWER(TRIM(json_extract(u.value, '$.model'))) AS model,
+                CAST(SUM(COALESCE(json_extract(u.value, '$.tokens_in'), 0)) AS INTEGER) AS tokens_in,
+                CAST(SUM(COALESCE(json_extract(u.value, '$.tokens_out'), 0)) AS INTEGER) AS tokens_out,
+                CAST(SUM(COALESCE(json_extract(u.value, '$.tokens_cached_in'), 0)) AS INTEGER) AS tokens_cached_in,
+                CAST(SUM(COALESCE(json_extract(u.value, '$.request_count'), 1)) AS INTEGER) AS request_count,
+                COUNT(DISTINCT i.id) AS interval_count
+            FROM intervals i, json_each(i.usage_json) u
+            WHERE i.ingested_at >= ?1
+              AND (?2 IS NULL OR i.tier = ?2)
+              AND (?3 IS NULL OR i.window_type = ?3)
+            GROUP BY i.tier, i.window_type, model
+            ORDER BY i.tier, i.window_type, model
+            "#,
+        )
+        .bind(since_ts)
+        .bind(tier)
+        .bind(window_type)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ModelUsageSummary {
+                tier: r.get("tier"),
+                window_type: r.get("window_type"),
+                model: r.get("model"),
+                tokens_in: r.get::<i64, _>("tokens_in").max(0) as u64,
+                tokens_out: r.get::<i64, _>("tokens_out").max(0) as u64,
+                tokens_cached_in: r.get::<i64, _>("tokens_cached_in").max(0) as u64,
+                request_count: r.get::<i64, _>("request_count").max(0) as u64,
+                interval_count: r.get::<i64, _>("interval_count").max(0) as usize,
+            })
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_quota_changes_classification_and_usage_summary() {
+        let repo = SqliteRepository::connect_and_migrate("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Init -> Decrease -> AnomalyIncrease (same reset_time) -> Reset (new reset_time)
+        repo.insert_quota_snapshot("pro", "gemini-5h", 95.0, Some("2026-11-25T15:00:00Z"), 100)
+            .await
+            .unwrap();
+        repo.insert_quota_snapshot("pro", "gemini-5h", 90.0, Some("2026-11-25T15:00:00Z"), 200)
+            .await
+            .unwrap();
+        repo.insert_quota_snapshot("pro", "gemini-5h", 92.0, Some("2026-11-25T15:00:00Z"), 202)
+            .await
+            .unwrap();
+        repo.insert_quota_snapshot("pro", "gemini-5h", 99.8, Some("2026-11-25T20:00:00Z"), 300)
+            .await
+            .unwrap();
+
+        let clean = repo
+            .fetch_quota_changes(Some("gemini-5h"), false, 50)
+            .await
+            .unwrap();
+        assert_eq!(clean.len(), 3);
+        assert_eq!(clean[0].event_type, QuotaChangeType::Init);
+        assert_eq!(clean[1].event_type, QuotaChangeType::Decrease);
+        assert_eq!(clean[2].event_type, QuotaChangeType::Reset);
+
+        let all = repo
+            .fetch_quota_changes(Some("gemini-5h"), true, 50)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[2].event_type, QuotaChangeType::AnomalyIncrease);
+
+        repo.insert_interval_if_new(&NewInterval {
+            idempotency_key: "k1".to_string(),
+            tier: "pro".to_string(),
+            window_type: "gemini-5h".to_string(),
+            started_at: 100,
+            ended_at: 200,
+            delta_pct: 5.0,
+            quota_precision: 0.01,
+            usage: vec![UsageEntry {
+                model: "Gemini 4 Hydrogen (Medium)".to_string(),
+                tokens_in: 100_000,
+                tokens_out: 20_000,
+                tokens_cached_in: 500_000,
+                request_count: 3,
+            }],
+            ingested_at: 200,
+        })
+        .await
+        .unwrap();
+
+        let usage = repo
+            .fetch_usage_by_model(Some("pro"), Some("gemini-5h"), 0)
+            .await
+            .unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].model, "gemini 4 hydrogen (medium)");
+        assert_eq!(usage[0].tokens_in, 100_000);
+        assert_eq!(usage[0].tokens_out, 20_000);
+        assert_eq!(usage[0].tokens_cached_in, 500_000);
+        assert_eq!(usage[0].request_count, 3);
+        assert_eq!(usage[0].interval_count, 1);
     }
 }

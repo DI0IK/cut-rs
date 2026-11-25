@@ -1,11 +1,14 @@
 use crate::cli::common::{default_state_file_path, load_state};
 use crate::cli::webserver::get_running_webserver_url;
-use crate::config::{default_database_url, default_db_path};
+use crate::config::{Config, default_database_url, default_db_path};
 use crate::db::TelemetryRepository;
 use crate::db::sqlite::SqliteRepository;
+use crate::estimator::{DEFAULT_WINDOW_LIMIT, compute_partition_estimate};
+use crate::models::{QuotaChangeEvent, QuotaChangeType};
 use chrono::{DateTime, Utc};
 use clap::Args;
 use serde::Serialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Args)]
 pub struct StatusArgs {
@@ -25,6 +28,7 @@ struct StatusReport {
     webserver_url: Option<String>,
     tier: Option<String>,
     buckets: Vec<BucketStatus>,
+    recent_resets: Vec<QuotaChangeEvent>,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,6 +37,8 @@ struct BucketStatus {
     remaining_pct: f64,
     reset_in: Option<String>,
     reset_time: Option<String>,
+    bucket_api_equivalent_usd: Option<f64>,
+    pct_per_usd: Option<f64>,
 }
 
 pub async fn run_status(args: StatusArgs) {
@@ -44,14 +50,40 @@ pub async fn run_status(args: StatusArgs) {
         .is_some_and(|raw| raw.contains("cut-rs"));
 
     let db_path = default_db_path();
-    let recorded_intervals = if db_path.exists() {
-        match SqliteRepository::connect_and_migrate(&default_database_url()).await {
-            Ok(repo) => repo.count_intervals().await.unwrap_or(0),
-            Err(_) => 0,
+    let mut recorded_intervals = 0;
+    let mut bucket_equivs: HashMap<String, (f64, f64)> = HashMap::new();
+    let mut recent_resets = Vec::new();
+
+    if db_path.exists()
+        && let Ok(repo) = SqliteRepository::connect_and_migrate(&default_database_url()).await
+    {
+        recorded_intervals = repo.count_intervals().await.unwrap_or(0);
+        let cfg = Config::from_env();
+        let now_ts = Utc::now().timestamp();
+        if let Ok(keys) = repo.list_active_partitions().await {
+            for key in keys {
+                if let Ok(mut ivs) = repo.fetch_window_intervals(&key, 0, DEFAULT_WINDOW_LIMIT).await {
+                    ivs.sort_by_key(|iv| (iv.ended_at, iv.id));
+                    if let Some(snap) = compute_partition_estimate(&key, &ivs, now_ts, &cfg)
+                        && snap.bucket_api_equivalent_usd > 0.0
+                    {
+                        bucket_equivs.insert(
+                            key.window_type.clone(),
+                            (snap.bucket_api_equivalent_usd, snap.pct_per_usd),
+                        );
+                    }
+                }
+            }
         }
-    } else {
-        0
-    };
+        if let Ok(changes) = repo.fetch_quota_changes(None, false, 500).await {
+            recent_resets = changes
+                .into_iter()
+                .filter(|c| c.event_type == QuotaChangeType::Reset)
+                .rev()
+                .take(10)
+                .collect();
+        }
+    }
 
     let (webserver_running, webserver_pid, webserver_url) = match get_running_webserver_url() {
         Some((pid, url)) => (true, Some(pid), Some(url)),
@@ -68,11 +100,14 @@ pub async fn run_status(args: StatusArgs) {
         for (bucket_id, b) in &st.buckets {
             let reset_time = b.effective_reset_time().map(str::to_string);
             let reset_in = reset_time.as_deref().map(|r| format_countdown(r, now));
+            let equiv = bucket_equivs.get(&bucket_id.to_ascii_lowercase()).copied();
             buckets.push(BucketStatus {
                 bucket_id: bucket_id.clone(),
                 remaining_pct: (b.last_remaining_fraction * 100.0).clamp(0.0, 100.0),
                 reset_in,
                 reset_time,
+                bucket_api_equivalent_usd: equiv.map(|(usd, _)| usd),
+                pct_per_usd: equiv.map(|(_, ppu)| ppu),
             });
         }
         buckets.sort_by(|a, b| a.bucket_id.cmp(&b.bucket_id));
@@ -88,6 +123,7 @@ pub async fn run_status(args: StatusArgs) {
         webserver_url,
         tier,
         buckets,
+        recent_resets,
     };
 
     if args.json {
@@ -125,7 +161,14 @@ pub async fn run_status(args: StatusArgs) {
         println!("Quota Buckets ({tier_label}):");
         for b in &report.buckets {
             let reset = b.reset_in.as_deref().unwrap_or("reset unknown");
-            println!("  • {}: {:.1}% left ({reset})", b.bucket_id, b.remaining_pct);
+            let equiv = b
+                .bucket_api_equivalent_usd
+                .map(|u| format!(", 100% ≈ ${u:.2} API"))
+                .unwrap_or_default();
+            println!(
+                "  • {}: {:.1}% left ({reset}{equiv})",
+                b.bucket_id, b.remaining_pct
+            );
         }
     }
 }

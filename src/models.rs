@@ -82,11 +82,36 @@ pub struct QuotaSnapshotRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Identifiability {
-    High,
-    Moderate,
-    LowCollinear,
-    InsufficientSamples,
+pub enum QuotaChangeType {
+    Init,
+    Reset,
+    Decrease,
+    AnomalyIncrease,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaChangeEvent {
+    pub id: i64,
+    pub tier: String,
+    pub bucket_id: String,
+    pub recorded_at: i64,
+    pub prev_pct: Option<f64>,
+    pub curr_pct: f64,
+    pub delta_pct: Option<f64>,
+    pub reset_time: Option<String>,
+    pub event_type: QuotaChangeType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUsageSummary {
+    pub tier: String,
+    pub window_type: String,
+    pub model: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub tokens_cached_in: u64,
+    pub request_count: u64,
+    pub interval_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,45 +122,23 @@ pub enum ModelStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfidenceInterval {
-    pub lower: f64,
-    pub upper: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelWeightEstimate {
     pub model: String,
+    pub priced: bool,
+    pub usd_per_1m_in: f64,
+    pub usd_per_1m_out: f64,
+    pub usd_per_1m_cached_in: f64,
     pub pct_per_1m_in: f64,
-    pub pct_per_1m_in_ci: ConfidenceInterval,
     pub pct_per_1m_out: f64,
-    pub pct_per_1m_out_ci: ConfidenceInterval,
     pub pct_per_1m_cached_in: f64,
-    pub pct_per_1m_cached_in_ci: ConfidenceInterval,
-    pub identifiability: Identifiability,
+    pub total_tokens_in: u64,
+    pub total_tokens_out: u64,
+    pub total_tokens_cached_in: u64,
+    pub total_requests: u64,
+    pub total_api_usd: f64,
     pub sample_count: usize,
     pub last_seen_at: i64,
     pub status: ModelStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_mix: Option<TokenMix>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeEventType {
-    BucketAdded,
-    BucketRetired,
-    ModelAdded,
-    ModelRetired,
-    CostChange,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangeEvent {
-    pub timestamp: i64,
-    pub event_type: ChangeEventType,
-    pub description: String,
-    pub cusum_value: Option<f64>,
-    pub p_value: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -151,11 +154,14 @@ pub struct SnapshotPayload {
     pub tier: String,
     pub window_type: String,
     pub computed_at: i64,
-    pub regime_since: i64,
     pub sample_count_window: usize,
-    pub sigma_hat: f64,
     pub stale: bool,
+    pub pct_per_usd: f64,
+    pub bucket_api_equivalent_usd: f64,
+    pub pct_per_usd_p25: f64,
+    pub pct_per_usd_p75: f64,
+    pub total_api_usd: f64,
+    pub total_delta_pct: f64,
     pub token_mix: TokenMix,
     pub models: Vec<ModelWeightEstimate>,
-    pub recent_change_events: Vec<ChangeEvent>,
 }

@@ -1,7 +1,10 @@
 pub mod sqlite;
 
 use crate::error::AppError;
-use crate::models::{IntervalRecord, PartitionKey, QuotaSnapshotRow, UsageEntry};
+use crate::models::{
+    IntervalRecord, ModelUsageSummary, PartitionKey, QuotaChangeEvent, QuotaSnapshotRow,
+    UsageEntry,
+};
 use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
@@ -47,4 +50,18 @@ pub trait TelemetryRepository: Send + Sync {
         bucket_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<QuotaSnapshotRow>, AppError>;
+
+    async fn fetch_quota_changes(
+        &self,
+        bucket_id: Option<&str>,
+        include_anomalies: bool,
+        limit: usize,
+    ) -> Result<Vec<QuotaChangeEvent>, AppError>;
+
+    async fn fetch_usage_by_model(
+        &self,
+        tier: Option<&str>,
+        window_type: Option<&str>,
+        since_ts: i64,
+    ) -> Result<Vec<ModelUsageSummary>, AppError>;
 }

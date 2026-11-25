@@ -84,14 +84,15 @@ async fn test_local_sqlite_on_demand_estimates_history_predict_and_quota() {
         .await
         .unwrap();
 
-    // Insert 15 synthetic intervals: true costs in=2.0, out=10.0, cached=0.2 pct/1M
+    // Insert 15 synthetic intervals for hydrogen ($1.5 / $7.5 / $0.075 per 1M),
+    // with 1 USD = 1.0% quota (so 100% bucket = $100 API equivalent, in=1.5%, out=7.5%, cached=0.075%).
     for i in 0..15 {
         let t_in = 100_000 + i * 25_000;
         let t_out = 10_000 + i * 5_000;
         let t_cache = 40_000 + ((i * 7) % 11) * 15_000;
-        let delta = 2.0 * (t_in as f64 / 1e6)
-            + 10.0 * (t_out as f64 / 1e6)
-            + 0.2 * (t_cache as f64 / 1e6);
+        let delta = 1.5 * (t_in as f64 / 1e6)
+            + 7.5 * (t_out as f64 / 1e6)
+            + 0.075 * (t_cache as f64 / 1e6);
 
         let inserted = state
             .repo
@@ -104,7 +105,7 @@ async fn test_local_sqlite_on_demand_estimates_history_predict_and_quota() {
                 delta_pct: delta,
                 quota_precision: 0.01,
                 usage: vec![UsageEntry {
-                    model: "gemini-4".to_string(),
+                    model: "gemini 4 hydrogen (medium)".to_string(),
                     tokens_in: t_in,
                     tokens_out: t_out,
                     tokens_cached_in: t_cache,
@@ -129,6 +130,7 @@ async fn test_local_sqlite_on_demand_estimates_history_predict_and_quota() {
     assert_eq!(quota["buckets"][0]["bucket_id"], "5h");
     assert_eq!(quota["buckets"][0]["reset_time"], "2026-11-18T13:55:00Z");
     assert_eq!(quota["history"].as_array().unwrap().len(), 1);
+    assert_eq!(quota["changes"].as_array().unwrap().len(), 1);
 
     let (st, parts) = get_json(&app, "/v1/estimates").await;
     assert_eq!(st, StatusCode::OK);
@@ -136,10 +138,12 @@ async fn test_local_sqlite_on_demand_estimates_history_predict_and_quota() {
 
     let (st, est) = get_json(&app, "/v1/estimates/antigravity/pro").await;
     assert_eq!(st, StatusCode::OK);
-    let m = &est["windows"][0]["models"][0];
-    assert_eq!(m["model"], "gemini-4");
-    assert!((m["pct_per_1m_in"].as_f64().unwrap() - 2.0).abs() < 0.25);
-    assert!((m["pct_per_1m_out"].as_f64().unwrap() - 10.0).abs() < 0.5);
+    let win = &est["windows"][0];
+    assert!((win["bucket_api_equivalent_usd"].as_f64().unwrap() - 100.0).abs() < 1e-4);
+    let m = &win["models"][0];
+    assert_eq!(m["model"], "gemini 4 hydrogen (medium)");
+    assert!((m["pct_per_1m_in"].as_f64().unwrap() - 1.5).abs() < 1e-4);
+    assert!((m["pct_per_1m_out"].as_f64().unwrap() - 7.5).abs() < 1e-4);
 
     let (st, hist) = get_json(&app, "/v1/estimates/antigravity/pro/history").await;
     assert_eq!(st, StatusCode::OK);
@@ -151,7 +155,7 @@ async fn test_local_sqlite_on_demand_estimates_history_predict_and_quota() {
         serde_json::json!({
             "window_type": "5h",
             "usage": [{
-                "model": "gemini-4",
+                "model": "gemini 4 hydrogen (medium)",
                 "tokens_in": 1_000_000,
                 "tokens_out": 100_000,
                 "tokens_cached_in": 500_000,
@@ -162,6 +166,7 @@ async fn test_local_sqlite_on_demand_estimates_history_predict_and_quota() {
     .await;
     assert_eq!(st, StatusCode::OK);
     let expected = pred["expected_delta_pct"].as_f64().unwrap();
-    // 1.0*2.0 + 0.1*10.0 + 0.5*0.2 = 3.1
-    assert!((expected - 3.1).abs() < 0.3, "expected={expected}");
+    // 1.0*1.5 + 0.1*7.5 + 0.5*0.075 = 2.2875
+    assert!((expected - 2.2875).abs() < 1e-4, "expected={expected}");
+    assert!((pred["expected_api_usd"].as_f64().unwrap() - 2.2875).abs() < 1e-4);
 }

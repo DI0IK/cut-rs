@@ -186,8 +186,8 @@ export function Predictor({ provider, tier, windowType, models }: Props) {
                   )}
                 </div>
                 <div className="mono" style={{ fontSize: 11, color: "var(--ink-muted)" }}>
-                  95% CI: [{result.ci_95_lower.toFixed(3)}% – {result.ci_95_upper.toFixed(3)}%] ·{" "}
-                  σ̂={result.sigma_hat.toFixed(3)}%
+                  IQR: [{result.ci_95_lower.toFixed(3)}% – {result.ci_95_upper.toFixed(3)}%] ·{" "}
+                  ~${result.expected_api_usd.toFixed(4)} API ({result.pct_per_usd.toFixed(2)}%/USD)
                 </div>
               </div>
             )}

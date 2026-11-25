@@ -5,10 +5,10 @@ import { ModelTable, ModelTableRow } from "./components/ModelTable";
 import { Predictor } from "./components/Predictor";
 import { HoverCard } from "./components/HoverCard";
 import {
-  ChangeEvent,
   CurrentBucketStatus,
   HistorySnapshotPoint,
   PartitionSummary,
+  QuotaChangeEvent,
   QuotaSnapshotRow,
   QuotaStatusResponse,
   WindowEstimateView,
@@ -114,7 +114,7 @@ export function App() {
   const [partitions, setPartitions] = useState<PartitionSummary[]>([]);
   const [tier, setTier] = useState<string>("all");
   const [windowType, setWindowType] = useState<string>("all");
-  const [metric, setMetric] = useState<CostMetric>("blended");
+  const [metric, setMetric] = useState<CostMetric>("equiv");
 
   const [quotaStatus, setQuotaStatus] = useState<QuotaStatusResponse | null>(null);
   const [history, setHistory] = useState<HistorySnapshotPoint[]>([]);
@@ -122,7 +122,7 @@ export function App() {
     { tier: string; view: WindowEstimateView }[]
   >([]);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
-  const [onlyCostEvents, setOnlyCostEvents] = useState(false);
+  const [onlyResets, setOnlyResets] = useState(false);
 
   const tiersForProvider = useMemo(
     () =>
@@ -238,8 +238,9 @@ export function App() {
         view.models.map((m) => ({
           tier: t,
           windowType: view.window_type,
-          mix: m.token_mix ?? view.token_mix,
-          sigmaHat: view.sigma_hat,
+          mix: view.token_mix,
+          pctPerUsd: view.pct_per_usd,
+          bucketApiEquivUsd: view.bucket_api_equivalent_usd,
           model: m,
         }))
       ),
@@ -281,18 +282,13 @@ export function App() {
     };
   }, [windowsByTier]);
 
-  const recentEvents = useMemo(() => {
-    const map = new Map<string, ChangeEvent>();
-    for (const { view } of windowsByTier) {
-      for (const ev of view.recent_change_events) {
-        if (onlyCostEvents && ev.event_type !== "cost_change") continue;
-        map.set(`${ev.timestamp}-${ev.event_type}-${ev.description}`, ev);
-      }
-    }
-    return Array.from(map.values())
-      .sort((a, b) => b.timestamp - a.timestamp)
+  const recentChanges: QuotaChangeEvent[] = useMemo(() => {
+    const list = quotaStatus?.changes ?? [];
+    return [...list]
+      .filter((ev) => !onlyResets || ev.event_type === "reset")
+      .reverse()
       .slice(0, 30);
-  }, [windowsByTier, onlyCostEvents]);
+  }, [quotaStatus, onlyResets]);
 
   return (
     <div className="shell">
@@ -431,6 +427,23 @@ export function App() {
                       ? "Not started"
                       : formatResetCountdown(b.reset_time)}
                   </div>
+                  {(() => {
+                    const part = partitions.find(
+                      (p) =>
+                        p.window_type === b.bucket_id.toLowerCase() &&
+                        (tier === "all" || p.tier === tier)
+                    );
+                    if (!part || part.bucket_api_equivalent_usd <= 0) return null;
+                    return (
+                      <div
+                        className="mono"
+                        style={{ fontSize: 11, marginTop: 4, opacity: 0.85 }}
+                      >
+                        100% ≈ ${part.bucket_api_equivalent_usd.toFixed(2)} API (
+                        {part.pct_per_usd.toFixed(2)}%/USD)
+                      </div>
+                    );
+                  })()}
 
                   {pace && (
                     <div
@@ -568,41 +581,43 @@ export function App() {
 
       <section className="panel">
         <div className="panel-head">
-          <span className="panel-title">Change Events & Cost Shifts</span>
+          <span className="panel-title">Quota Changes & Resets</span>
           <div className="controls">
             <button
               type="button"
-              className={`btn btn-sm ${!onlyCostEvents ? "active" : ""}`}
-              onClick={() => setOnlyCostEvents(false)}
+              className={`btn btn-sm ${!onlyResets ? "active" : ""}`}
+              onClick={() => setOnlyResets(false)}
             >
               All
             </button>
             <button
               type="button"
-              className={`btn btn-sm ${onlyCostEvents ? "active" : ""}`}
-              onClick={() => setOnlyCostEvents(true)}
+              className={`btn btn-sm ${onlyResets ? "active" : ""}`}
+              onClick={() => setOnlyResets(true)}
             >
-              Cost shifts
+              Resets only
             </button>
           </div>
         </div>
-        {recentEvents.length === 0 ? (
-          <div className="empty">No change events recorded yet.</div>
+        {recentChanges.length === 0 ? (
+          <div className="empty">No quota changes recorded yet.</div>
         ) : (
           <div className="events-list">
-            {recentEvents.map((ev, idx) => (
-              <div
-                className="event-item"
-                key={`${ev.timestamp}-${ev.event_type}-${idx}`}
-              >
+            {recentChanges.map((ev) => (
+              <div className="event-item" key={ev.id}>
                 <span className="event-time">
-                  {new Date(ev.timestamp * 1000).toLocaleString()}
+                  {new Date(ev.recorded_at * 1000).toLocaleString()}
                 </span>
-                <span className="event-desc">{ev.description}</span>
-                {ev.p_value !== undefined && ev.p_value !== null && (
-                  <span className="event-meta">
-                    p={ev.p_value.toExponential(2)}
-                  </span>
+                <span className="event-desc">
+                  <strong>{ev.bucket_id}</strong> ({ev.event_type}):{" "}
+                  {ev.prev_pct !== null ? `${ev.prev_pct.toFixed(2)}% → ` : ""}
+                  {ev.curr_pct.toFixed(2)}%
+                  {ev.delta_pct !== null
+                    ? ` (${ev.delta_pct >= 0 ? "+" : ""}${ev.delta_pct.toFixed(2)}%)`
+                    : ""}
+                </span>
+                {ev.reset_time && (
+                  <span className="event-meta">reset {ev.reset_time}</span>
                 )}
               </div>
             ))}

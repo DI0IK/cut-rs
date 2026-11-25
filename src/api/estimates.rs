@@ -1,11 +1,11 @@
 use crate::api::AppState;
 use crate::cli::common::load_state;
 use crate::error::AppError;
-use crate::estimator::{compute_partition_estimate, compute_partition_history};
-use crate::math::changepoint::W_LONG;
-use crate::math::irls::fit_irls_nnls;
+use crate::estimator::{
+    DEFAULT_WINDOW_LIMIT, compute_partition_estimate, compute_partition_history, predict_usage,
+};
 use crate::models::{
-    ChangeEvent, ModelStatus, ModelWeightEstimate, PartitionKey, QuotaSnapshotRow, TokenMix,
+    ModelStatus, ModelWeightEstimate, PartitionKey, QuotaChangeEvent, QuotaSnapshotRow, TokenMix,
     UsageEntry, normalize_key,
 };
 use axum::Json;
@@ -14,7 +14,6 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::IntoResponse;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Debug, Serialize)]
 pub struct CurrentBucketStatus {
@@ -30,12 +29,15 @@ pub struct QuotaStatusResponse {
     pub tier: Option<String>,
     pub buckets: Vec<CurrentBucketStatus>,
     pub history: Vec<QuotaSnapshotRow>,
+    pub changes: Vec<QuotaChangeEvent>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct QuotaQuery {
     pub bucket_id: Option<String>,
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub include_anomalies: bool,
 }
 
 pub async fn get_quota_status(
@@ -64,12 +66,17 @@ pub async fn get_quota_status(
         .repo
         .fetch_quota_history(query.bucket_id.as_deref(), limit)
         .await?;
+    let changes = state
+        .repo
+        .fetch_quota_changes(query.bucket_id.as_deref(), query.include_anomalies, limit)
+        .await?;
 
     Ok(Json(QuotaStatusResponse {
         provider: "antigravity".to_string(),
         tier,
         buckets,
         history,
+        changes,
     }))
 }
 
@@ -84,13 +91,16 @@ pub struct EstimatesQuery {
 pub struct WindowEstimateView {
     pub window_type: String,
     pub computed_at: i64,
-    pub regime_since: i64,
     pub sample_count_window: usize,
-    pub sigma_hat: f64,
     pub stale: bool,
+    pub pct_per_usd: f64,
+    pub bucket_api_equivalent_usd: f64,
+    pub pct_per_usd_p25: f64,
+    pub pct_per_usd_p75: f64,
+    pub total_api_usd: f64,
+    pub total_delta_pct: f64,
     pub token_mix: TokenMix,
     pub models: Vec<ModelWeightEstimate>,
-    pub recent_change_events: Vec<ChangeEvent>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +109,8 @@ pub struct PartitionSummary {
     pub tier: String,
     pub window_type: String,
     pub sample_count_window: usize,
+    pub bucket_api_equivalent_usd: f64,
+    pub pct_per_usd: f64,
     pub token_mix: TokenMix,
     pub stale: bool,
     pub computed_at: i64,
@@ -117,7 +129,10 @@ pub async fn list_partitions(
     let mut partitions = Vec::new();
 
     for key in keys {
-        let mut intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+        let mut intervals = state
+            .repo
+            .fetch_window_intervals(&key, 0, DEFAULT_WINDOW_LIMIT)
+            .await?;
         intervals.sort_by_key(|iv| (iv.ended_at, iv.id));
         if let Some(snap) = compute_partition_estimate(&key, &intervals, now, &state.config) {
             partitions.push(PartitionSummary {
@@ -125,6 +140,8 @@ pub async fn list_partitions(
                 tier: snap.tier,
                 window_type: snap.window_type,
                 sample_count_window: snap.sample_count_window,
+                bucket_api_equivalent_usd: snap.bucket_api_equivalent_usd,
+                pct_per_usd: snap.pct_per_usd,
                 token_mix: snap.token_mix,
                 stale: snap.stale,
                 computed_at: snap.computed_at,
@@ -149,23 +166,14 @@ pub struct HistoryQuery {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct HistoryModelPoint {
-    pub model: String,
-    pub pct_per_1m_in: f64,
-    pub pct_per_1m_out: f64,
-    pub pct_per_1m_cached_in: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct HistorySnapshotPoint {
     pub tier: String,
     pub window_type: String,
     pub computed_at: i64,
-    pub regime_since: i64,
     pub sample_count_window: usize,
+    pub pct_per_usd: f64,
+    pub bucket_api_equivalent_usd: f64,
     pub token_mix: TokenMix,
-    pub models: Vec<HistoryModelPoint>,
-    pub recent_change_events: Vec<ChangeEvent>,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,36 +221,24 @@ pub async fn get_estimates_history(
     let now = Utc::now().timestamp();
     let mut points = Vec::new();
     for key in matching_keys {
-        let mut intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+        let mut intervals = state
+            .repo
+            .fetch_window_intervals(&key, 0, DEFAULT_WINDOW_LIMIT)
+            .await?;
         if intervals.is_empty() {
             continue;
         }
         intervals.sort_by_key(|iv| (iv.ended_at, iv.id));
         let snaps = compute_partition_history(&key, &intervals, now, &state.config, 40);
         for s in snaps {
-            let active_models: Vec<HistoryModelPoint> = s
-                .models
-                .into_iter()
-                .filter(|m| m.status == ModelStatus::Active)
-                .map(|m| HistoryModelPoint {
-                    model: m.model,
-                    pct_per_1m_in: m.pct_per_1m_in,
-                    pct_per_1m_out: m.pct_per_1m_out,
-                    pct_per_1m_cached_in: m.pct_per_1m_cached_in,
-                })
-                .collect();
-            if active_models.is_empty() {
-                continue;
-            }
             points.push(HistorySnapshotPoint {
                 tier: s.tier,
                 window_type: s.window_type,
                 computed_at: s.computed_at,
-                regime_since: s.regime_since,
                 sample_count_window: s.sample_count_window,
+                pct_per_usd: s.pct_per_usd,
+                bucket_api_equivalent_usd: s.bucket_api_equivalent_usd,
                 token_mix: s.token_mix,
-                models: active_models,
-                recent_change_events: s.recent_change_events,
             });
         }
     }
@@ -288,7 +284,10 @@ pub async fn get_estimates(
         {
             continue;
         }
-        let mut intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+        let mut intervals = state
+            .repo
+            .fetch_window_intervals(&key, 0, DEFAULT_WINDOW_LIMIT)
+            .await?;
         intervals.sort_by_key(|iv| (iv.ended_at, iv.id));
         let Some(snap) = compute_partition_estimate(&key, &intervals, now, &state.config) else {
             continue;
@@ -305,13 +304,16 @@ pub async fn get_estimates(
         windows.push(WindowEstimateView {
             window_type: snap.window_type,
             computed_at: snap.computed_at,
-            regime_since: snap.regime_since,
             sample_count_window: snap.sample_count_window,
-            sigma_hat: snap.sigma_hat,
             stale: snap.stale,
+            pct_per_usd: snap.pct_per_usd,
+            bucket_api_equivalent_usd: snap.bucket_api_equivalent_usd,
+            pct_per_usd_p25: snap.pct_per_usd_p25,
+            pct_per_usd_p75: snap.pct_per_usd_p75,
+            total_api_usd: snap.total_api_usd,
+            total_delta_pct: snap.total_delta_pct,
             token_mix: snap.token_mix,
             models: active_models,
-            recent_change_events: snap.recent_change_events,
         });
     }
 
@@ -351,9 +353,10 @@ pub struct PredictResponse {
     pub tier: String,
     pub window_type: String,
     pub expected_delta_pct: f64,
+    pub expected_api_usd: f64,
     pub ci_95_lower: f64,
     pub ci_95_upper: f64,
-    pub sigma_hat: f64,
+    pub pct_per_usd: f64,
 }
 
 pub async fn predict_quota(
@@ -384,70 +387,26 @@ pub async fn predict_quota(
         AppError::NotFound(format!("no intervals available for {provider}/{tier}"))
     })?;
 
-    let intervals = state.repo.fetch_window_intervals(&key, 0, W_LONG).await?;
+    let mut intervals = state
+        .repo
+        .fetch_window_intervals(&key, 0, DEFAULT_WINDOW_LIMIT)
+        .await?;
+    intervals.sort_by_key(|iv| (iv.ended_at, iv.id));
     let now = Utc::now().timestamp();
-    let fit = fit_irls_nnls(&intervals, now, state.config.model_stale_days).ok_or_else(|| {
+    let snap = compute_partition_estimate(&key, &intervals, now, &state.config).ok_or_else(|| {
         AppError::NotFound(format!("insufficient data to predict for {provider}/{tier}"))
     })?;
 
-    let p = fit.feature_names.len();
-    let feat_idx: HashMap<&str, usize> = fit
-        .feature_names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.as_str(), i))
-        .collect();
-
-    let mut x = vec![0.0_f64; p];
-    let mut w = vec![0.0_f64; p];
-
-    for m in &fit.models {
-        if let Some(&idx) = feat_idx.get(format!("{}:in", m.model).as_str()) {
-            w[idx] = m.pct_per_1m_in;
-        }
-        if let Some(&idx) = feat_idx.get(format!("{}:out", m.model).as_str()) {
-            w[idx] = m.pct_per_1m_out;
-        }
-        if let Some(&idx) = feat_idx.get(format!("{}:cached_in", m.model).as_str()) {
-            w[idx] = m.pct_per_1m_cached_in;
-        }
-    }
-
-    for u in &req.usage {
-        let model = normalize_key(&u.model);
-        if let Some(&idx) = feat_idx.get(format!("{model}:in").as_str()) {
-            x[idx] += u.tokens_in as f64 / 1_000_000.0;
-        }
-        if let Some(&idx) = feat_idx.get(format!("{model}:out").as_str()) {
-            x[idx] += u.tokens_out as f64 / 1_000_000.0;
-        }
-        if let Some(&idx) = feat_idx.get(format!("{model}:cached_in").as_str()) {
-            x[idx] += u.tokens_cached_in as f64 / 1_000_000.0;
-        }
-    }
-
-    let mu: f64 = x.iter().zip(w.iter()).map(|(xi, wi)| xi * wi).sum();
-
-    let mut x_cov_x = 0.0_f64;
-    if fit.covariance_matrix.len() == p * p {
-        for r in 0..p {
-            if x[r] == 0.0 {
-                continue;
-            }
-            for c in 0..p {
-                x_cov_x += x[r] * fit.covariance_matrix[r * p + c] * x[c];
-            }
-        }
-    }
-    let pred_se = (fit.sigma_hat.powi(2) + x_cov_x.max(0.0)).sqrt();
+    let pred = predict_usage(&snap, &req.usage);
 
     Ok(Json(PredictResponse {
         provider,
         tier,
         window_type: key.window_type,
-        expected_delta_pct: mu,
-        ci_95_lower: (mu - 1.96 * pred_se).max(0.0),
-        ci_95_upper: mu + 1.96 * pred_se,
-        sigma_hat: fit.sigma_hat,
+        expected_delta_pct: pred.expected_delta_pct,
+        expected_api_usd: pred.expected_api_usd,
+        ci_95_lower: pred.ci_95_lower,
+        ci_95_upper: pred.ci_95_upper,
+        pct_per_usd: pred.pct_per_usd,
     }))
 }
